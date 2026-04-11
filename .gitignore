@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.dll
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.tox/
+.nox/
+.venv/
+venv/
+env/
+
+# ARCA outputs (generated at runtime)
+arca_outputs/
+
+# C++ build artifacts
+*.o
+*.a
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# MyPy
+.mypy_cache/
+
+# Secrets / env
+.env
+.env.local
+*.pem
+*.key
+
+# Models (large binary files — push separately if needed)
+arca_outputs/models/
+*.zip
+
+# Logs
+*.log
