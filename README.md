@@ -187,4 +187,8 @@ ARCA is a **simulation and education tool only**. All attack actions run inside 
 ## Author
 
 **Dipayan Dasgupta** — IIT Madras, Civil Engineering  
+<<<<<<< HEAD
 [GitHub](https://github.com/dipayandasgupta) · [LinkedIn](https://www.linkedin.com/in/dipayan-dasgupta-24a24719b/)
+=======
+[GitHub](https://github.com/dipayandasgupta) · [LinkedIn]((https://www.linkedin.com/in/dipayan-dasgupta-24a24719b/)])
+>>>>>>> d1509226ab3ae74aff6766f1de4f82a2a33e7994
