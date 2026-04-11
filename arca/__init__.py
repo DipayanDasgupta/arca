@@ -21,12 +21,14 @@ Quickstart
     print(result.summary())
 """
 
+"""ARCA — Autonomous Reinforcement Cyber Agent"""
+
 from arca.__version__ import __version__
 from arca.core.config import ARCAConfig
 from arca.sim.environment import NetworkEnv
 from arca.core.agent import ARCAAgent
 from arca.core.trainer import ARCATrainer
-from arca.viz.dashboard import ARCADashboard
+from arca.viz.visualizer import ARCAVisualizer
 
 __all__ = [
     "__version__",
@@ -34,5 +36,5 @@ __all__ = [
     "NetworkEnv",
     "ARCAAgent",
     "ARCATrainer",
-    "ARCADashboard",
+    "ARCAVisualizer",
 ]
