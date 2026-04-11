@@ -1,7 +1,10 @@
+
+
 # ARCA — Autonomous Reinforcement Cyber Agent
 
 > **A fully local, pip-installable RL-powered cyber pentesting simulation framework with LangGraph orchestration and optional C++ acceleration.**
 
+[![PyPI version](https://img.shields.io/pypi/v/arca-agent.svg)](https://pypi.org/project/arca-agent/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![RL](https://img.shields.io/badge/RL-PPO%20%7C%20A2C%20%7C%20DQN-orange)](https://stable-baselines3.readthedocs.io)
@@ -27,6 +30,13 @@ Everything runs **100% locally** — no cloud, no data leaves your machine.
 
 ## Installation
 
+**Install via PyPI (Recommended)**
+```bash
+pip install arca-agent
+```
+*(Note: If your system has a C++ compiler like `g++` or `clang`, pip will automatically compile the high-performance C++ extensions during installation. Otherwise, it will gracefully fall back to the pure-Python implementation.)*
+
+**Install from Source (For Development)**
 ```bash
 git clone https://github.com/dipayandasgupta/arca.git
 cd arca
@@ -35,10 +45,10 @@ cd arca
 python -m venv venv
 source venv/bin/activate       # Windows: venv\Scripts\activate
 
-# Install (pure Python — always works)
+# Install in editable mode
 pip install -e .
 
-# Install with C++ acceleration (requires g++/clang and pybind11)
+# Install with explicit C++ dependencies
 pip install -e ".[cpp]"
 
 # Install dev dependencies
@@ -104,7 +114,7 @@ arca viz --output ./figures     # generate all plots
 
 ## LangGraph Architecture
 
-```
+```text
 START → analyst_node → attacker_node → critic_node → reflect_node → END
                               ↑___________________________|
                                    (reflection loop)
@@ -143,7 +153,7 @@ Once you run `arca serve`:
 
 ## Project Structure
 
-```
+```text
 arca/
 ├── arca/
 │   ├── __init__.py          # public API
@@ -187,8 +197,4 @@ ARCA is a **simulation and education tool only**. All attack actions run inside 
 ## Author
 
 **Dipayan Dasgupta** — IIT Madras, Civil Engineering  
-<<<<<<< HEAD
 [GitHub](https://github.com/dipayandasgupta) · [LinkedIn](https://www.linkedin.com/in/dipayan-dasgupta-24a24719b/)
-=======
-[GitHub](https://github.com/dipayandasgupta) · [LinkedIn]((https://www.linkedin.com/in/dipayan-dasgupta-24a24719b/)])
->>>>>>> d1509226ab3ae74aff6766f1de4f82a2a33e7994
