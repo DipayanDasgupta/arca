@@ -7,7 +7,7 @@
 
   > **A fully local, pip-installable RL-powered cyber pentesting simulation framework with LangGraph orchestration and optional C++ acceleration.**
 
-  [![PyPI version](https://img.shields.io/pypi/v/arca-agent.svg)](https://pypi.org/project/arca-agent/)
+  [![PyPI version](https://img.shields.io/pypi/v/arca-agent.svg)](https://pypi.org/project/arca-agent/0.2.3/)
   [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
   [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
   [![RL](https://img.shields.io/badge/RL-PPO%20%7C%20A2C%20%7C%20DQN-orange)](https://stable-baselines3.readthedocs.io)
