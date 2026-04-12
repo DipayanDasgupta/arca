@@ -47,3 +47,13 @@ my_office.yaml
 # Temporary visual outputs
 arca_test_visuals/
 *.html
+# Generated and temporary files - do not track
+context.txt
+generate_context.sh
+test_comprehensive.py
+test_run.py
+my_*.yaml
+my_home_network.yaml
+my_office.yaml
+arca_test_visuals/
+*.html
