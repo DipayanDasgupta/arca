@@ -1,6 +1,6 @@
 [project]
 name = "arca-agent"
-version = "0.1.1"
+version = "0.1.2"
 description = "ARCA — Local RL-powered Autonomous Cyber Pentesting Agent with LangGraph"
 readme = "README.md"
 requires-python = ">=3.10"
