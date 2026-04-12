@@ -1,12 +1,21 @@
 [project]
 name = "arca-agent"
-version = "0.1.2"
+version = "0.2.3"
 description = "ARCA — Local RL-powered Autonomous Cyber Pentesting Agent with LangGraph"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "Dipayan Dasgupta", email = "deep.dasgupta2006@gmail.com"}]
 keywords = ["reinforcement-learning", "cybersecurity", "pentesting", "langgraph", "agentic-ai", "pybind11"]
+
+dependencies = [
+    "numpy>=1.24", "gymnasium>=0.29", "stable-baselines3>=2.2",
+    "networkx>=3.0", "torch>=2.0", "fastapi>=0.110",
+    "uvicorn[standard]>=0.29", "pydantic>=2.0", "rich>=13.0",
+    "typer>=0.12", "matplotlib>=3.8", "plotly>=5.20",
+    "langgraph>=0.1", "langchain>=0.2", "ollama>=0.2",
+    "pyyaml>=6.0", "pandas>=2.0"
+]
 
 [project.urls]
 Homepage = "https://github.com/DipayanDasgupta/arca"
@@ -28,13 +37,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["arca*"]
+exclude = ["tests*", "examples*"]
 
 [tool.setuptools.package-data]
-arca = ["configs/*.yaml", "data/*.json"]
+"arca.cpp_ext" = ["*.cpp"]
 
-[tool.black]
-line-length = 100
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-v --tb=short"
+[tool.setuptools]
+include-package-data = true
+zip-safe = false
