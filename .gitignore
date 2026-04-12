@@ -57,3 +57,8 @@ my_home_network.yaml
 my_office.yaml
 arca_test_visuals/
 *.html
+
+# Never commit demo folder or any files with secrets
+demo/
+*.zip
+test_llm*.py
