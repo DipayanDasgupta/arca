@@ -15,7 +15,7 @@
 # ================================================
 [project]
 name = "arca-agent"
-version = "0.1.1"
+version = "0.1.2"
 description = "ARCA — Local RL-powered Autonomous Cyber Pentesting Agent with LangGraph"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -479,7 +479,7 @@ __all__ = [
 
 # File: arca/__version__.py
 # ================================================
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 
 
@@ -1330,6 +1330,779 @@ class ActionResult:
 
 
 
+# File: arca/sim/custom_network.py
+# ================================================
+"""
+arca.sim.custom_network
+=======================
+Lets users define and load their own real-world-inspired network topologies.
+
+Usage (Python):
+    from arca.sim.custom_network import CustomNetworkBuilder
+    env = CustomNetworkBuilder.from_yaml("my_network.yaml")
+
+Usage (CLI):
+    arca train --network my_network.yaml
+
+YAML Format:
+    See examples/my_home_network.yaml for a full template.
+"""
+
+from __future__ import annotations
+
+import json
+import random
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import networkx as nx
+import yaml
+
+from arca.sim.host import Host, HostStatus
+from arca.core.config import ARCAConfig, EnvConfig
+
+
+# ── Well-known CVE library (expanded) ────────────────────────────────────────
+
+CVE_LIBRARY = {
+    # Windows vulns
+    "EternalBlue":      {"cve": "CVE-2017-0144", "exploit_prob": 0.78, "os": ["Windows"], "service": "SMB",  "severity": "CRITICAL"},
+    "BlueKeep":         {"cve": "CVE-2019-0708", "exploit_prob": 0.72, "os": ["Windows"], "service": "RDP",  "severity": "CRITICAL"},
+    "ProxyLogon":       {"cve": "CVE-2021-26855","exploit_prob": 0.71, "os": ["Windows"], "service": "HTTP", "severity": "CRITICAL"},
+    "PrintNightmare":   {"cve": "CVE-2021-34527","exploit_prob": 0.65, "os": ["Windows"], "service": "SMB",  "severity": "HIGH"},
+    "ZeroLogon":        {"cve": "CVE-2020-1472", "exploit_prob": 0.85, "os": ["Windows"], "service": "SMB",  "severity": "CRITICAL"},
+    "MS17-010":         {"cve": "CVE-2017-0145", "exploit_prob": 0.75, "os": ["Windows"], "service": "SMB",  "severity": "CRITICAL"},
+    # Linux vulns
+    "Log4Shell":        {"cve": "CVE-2021-44228","exploit_prob": 0.82, "os": ["Linux"],   "service": "HTTP", "severity": "CRITICAL"},
+    "Shellshock":       {"cve": "CVE-2014-6271", "exploit_prob": 0.66, "os": ["Linux"],   "service": "HTTP", "severity": "HIGH"},
+    "Heartbleed":       {"cve": "CVE-2014-0160", "exploit_prob": 0.61, "os": ["Linux"],   "service": "HTTPS","severity": "HIGH"},
+    "DirtyCOW":         {"cve": "CVE-2016-5195", "exploit_prob": 0.57, "os": ["Linux"],   "service": "SSH",  "severity": "HIGH"},
+    "PwnKit":           {"cve": "CVE-2021-4034", "exploit_prob": 0.80, "os": ["Linux"],   "service": "SSH",  "severity": "HIGH"},
+    "Spring4Shell":     {"cve": "CVE-2022-22965","exploit_prob": 0.68, "os": ["Linux"],   "service": "HTTP", "severity": "CRITICAL"},
+    # IoT / embedded
+    "IoTDefaultCreds":  {"cve": "CVE-2020-8958", "exploit_prob": 0.91, "os": ["IoT"],     "service": "Telnet","severity": "CRITICAL"},
+    "RouteRCE":         {"cve": "CVE-2021-20090","exploit_prob": 0.74, "os": ["IoT"],     "service": "HTTP", "severity": "HIGH"},
+    # macOS
+    "TCC_Bypass":       {"cve": "CVE-2023-41990","exploit_prob": 0.52, "os": ["macOS"],   "service": "HTTP", "severity": "HIGH"},
+    # Web / app layer
+    "SQLInjection":     {"cve": "CWE-89",        "exploit_prob": 0.70, "os": ["Linux","Windows"], "service": "HTTP", "severity": "HIGH"},
+    "RCE_WebApp":       {"cve": "CWE-78",        "exploit_prob": 0.63, "os": ["Linux","Windows"], "service": "HTTP", "severity": "CRITICAL"},
+    # Router / network
+    "Cisco_CVE":        {"cve": "CVE-2023-20198","exploit_prob": 0.77, "os": ["Router"],  "service": "HTTP", "severity": "CRITICAL"},
+    "RouterDefaultPwd": {"cve": "CWE-798",       "exploit_prob": 0.88, "os": ["Router"],  "service": "HTTP", "severity": "HIGH"},
+}
+
+DEFAULT_SERVICES = {
+    "Windows": ["SMB", "RDP", "WinRM", "IIS", "MSSQL", "HTTP"],
+    "Linux":   ["SSH", "HTTP", "HTTPS", "FTP", "PostgreSQL", "MySQL"],
+    "macOS":   ["SSH", "HTTP", "AFP", "VNC"],
+    "IoT":     ["Telnet", "HTTP", "MQTT", "SNMP"],
+    "Router":  ["HTTP", "HTTPS", "SSH", "Telnet", "SNMP"],
+    "Android": ["ADB", "HTTP"],
+    "Windows Server": ["SMB", "RDP", "IIS", "MSSQL", "AD-DS"],
+}
+
+
+# ── Schema ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class HostSpec:
+    """Raw spec from YAML before conversion to Host."""
+    id: int
+    name: str
+    os: str
+    subnet: int
+    ip: str
+    services: list[str] = field(default_factory=list)
+    vulns: list[str] = field(default_factory=list)        # CVE names from CVE_LIBRARY
+    is_critical: bool = False
+    firewall: bool = False
+    data_value: float = 5.0
+    notes: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict, host_id: int) -> "HostSpec":
+        return cls(
+            id=host_id,
+            name=d.get("name", f"host_{host_id}"),
+            os=d.get("os", "Linux"),
+            subnet=d.get("subnet", 0),
+            ip=d.get("ip", f"192.168.{d.get('subnet',0)}.{host_id+1}"),
+            services=d.get("services", DEFAULT_SERVICES.get(d.get("os", "Linux"), ["SSH"])),
+            vulns=d.get("vulns", []),
+            is_critical=d.get("is_critical", False),
+            firewall=d.get("firewall", False),
+            data_value=float(d.get("data_value", 5.0)),
+            notes=d.get("notes", ""),
+        )
+
+
+@dataclass
+class NetworkSpec:
+    """Full network topology spec from YAML."""
+    name: str
+    description: str
+    attacker_entry: str          # IP or host name of entry point
+    hosts: list[HostSpec]
+    connections: list[tuple[int, int]]   # (host_id_a, host_id_b) bidirectional
+    subnet_names: dict[int, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "NetworkSpec":
+        raw_hosts = d.get("hosts", [])
+        hosts = [HostSpec.from_dict(h, i) for i, h in enumerate(raw_hosts)]
+
+        # Parse connections: support both [a, b] and {from: a, to: b}
+        raw_conns = d.get("connections", [])
+        connections = []
+        for c in raw_conns:
+            if isinstance(c, list) and len(c) == 2:
+                connections.append((int(c[0]), int(c[1])))
+            elif isinstance(c, dict):
+                connections.append((int(c["from"]), int(c["to"])))
+
+        return cls(
+            name=d.get("name", "custom_network"),
+            description=d.get("description", ""),
+            attacker_entry=d.get("attacker_entry", hosts[0].ip if hosts else ""),
+            hosts=hosts,
+            connections=connections,
+            subnet_names=d.get("subnet_names", {}),
+        )
+
+
+# ── Builder ───────────────────────────────────────────────────────────────────
+
+class CustomNetworkBuilder:
+    """
+    Build a NetworkEnv from a user-defined YAML/JSON topology.
+
+    Example:
+        env = CustomNetworkBuilder.from_yaml("my_home_network.yaml")
+        agent = ARCAAgent(env=env)
+        agent.train(timesteps=30_000)
+    """
+
+    @classmethod
+    def from_yaml(cls, path: str | Path, cfg: Optional[ARCAConfig] = None) -> "CustomNetworkEnv":
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        spec = NetworkSpec.from_dict(data)
+        return cls._build(spec, cfg)
+
+    @classmethod
+    def from_json(cls, path: str | Path, cfg: Optional[ARCAConfig] = None) -> "CustomNetworkEnv":
+        with open(path) as f:
+            data = json.load(f)
+        spec = NetworkSpec.from_dict(data)
+        return cls._build(spec, cfg)
+
+    @classmethod
+    def from_dict(cls, data: dict, cfg: Optional[ARCAConfig] = None) -> "CustomNetworkEnv":
+        spec = NetworkSpec.from_dict(data)
+        return cls._build(spec, cfg)
+
+    @classmethod
+    def _build(cls, spec: NetworkSpec, cfg: Optional[ARCAConfig]) -> "CustomNetworkEnv":
+        cfg = cfg or ARCAConfig()
+
+        # Override env config to match the custom network
+        cfg.env = EnvConfig(
+            num_hosts=len(spec.hosts),
+            num_subnets=len({h.subnet for h in spec.hosts}),
+            vulnerability_density=1.0,   # user explicitly set vulns
+            max_steps=max(150, len(spec.hosts) * 20),
+        )
+
+        return CustomNetworkEnv(spec=spec, cfg=cfg)
+
+    @staticmethod
+    def generate_template(
+        path: str | Path,
+        preset: str = "home",
+        overwrite: bool = False,
+    ) -> None:
+        """
+        Generate a YAML template for the user to fill in.
+
+        Presets: "home" | "small_office" | "datacenter"
+        """
+        templates = {
+            "home": HOME_NETWORK_TEMPLATE,
+            "small_office": SMALL_OFFICE_TEMPLATE,
+            "datacenter": DATACENTER_TEMPLATE,
+        }
+        content = templates.get(preset, HOME_NETWORK_TEMPLATE)
+        p = Path(path)
+        if p.exists() and not overwrite:
+            raise FileExistsError(f"{path} already exists. Pass overwrite=True to replace.")
+        p.write_text(content)
+        print(f"[ARCA] Template written → {path}")
+        print(f"[ARCA] Edit the file, then run: CustomNetworkBuilder.from_yaml('{path}')")
+
+
+# ── CustomNetworkEnv ──────────────────────────────────────────────────────────
+
+import gymnasium as gym
+import numpy as np
+from gymnasium import spaces
+from arca.sim.action import Action, ActionType, ActionResult
+from arca.core.config import ARCAConfig, EnvConfig
+from arca.sim.environment import EpisodeInfo
+
+
+class CustomNetworkEnv(gym.Env):
+    """
+    Gymnasium environment backed by a user-defined network topology.
+    Identical interface to NetworkEnv — works with all ARCA tools.
+    """
+
+    metadata = {"render_modes": ["ansi", "human"]}
+    _HOST_FEATURES = 9
+    _NUM_EXPLOITS = 5
+
+    def __init__(self, spec: NetworkSpec, cfg: Optional[ARCAConfig] = None):
+        super().__init__()
+        self.spec = spec
+        self.cfg = cfg or ARCAConfig()
+        self.env_cfg = self.cfg.env
+        self._rng = random.Random(self.cfg.seed)
+        self._np_rng = np.random.default_rng(self.cfg.seed)
+
+        # Build static graph + hosts from spec
+        self._base_graph, self._base_hosts = self._build_from_spec()
+        self._find_attacker_node()
+
+        # Runtime state
+        self.graph: nx.DiGraph = nx.DiGraph()
+        self.hosts: dict[int, Host] = {}
+        self._attacker_node: int = 0
+        self._episode_info = EpisodeInfo()
+        self._step_count = 0
+
+        n = len(spec.hosts)
+        e = self._NUM_EXPLOITS
+        self.action_space = spaces.Discrete(len(ActionType) * n * e)
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0,
+            shape=(n * self._HOST_FEATURES,),
+            dtype=np.float32,
+        )
+
+    def _build_from_spec(self) -> tuple[nx.DiGraph, dict[int, Host]]:
+        g = nx.DiGraph()
+        hosts: dict[int, Host] = {}
+
+        for spec_host in self.spec.hosts:
+            # Resolve vulns from CVE_LIBRARY
+            resolved_vulns = []
+            for vname in spec_host.vulns:
+                if vname in CVE_LIBRARY:
+                    resolved_vulns.append({**CVE_LIBRARY[vname], "name": vname})
+                else:
+                    # Unknown vuln — add with moderate prob
+                    resolved_vulns.append({
+                        "name": vname, "cve": "UNKNOWN",
+                        "exploit_prob": 0.5, "os": [spec_host.os],
+                        "service": "HTTP", "severity": "MEDIUM",
+                    })
+
+            h = Host(
+                id=spec_host.id,
+                subnet=spec_host.subnet,
+                os=spec_host.os,
+                ip=spec_host.ip,
+                services=spec_host.services,
+                vulnerabilities=resolved_vulns,
+                is_critical=spec_host.is_critical,
+                firewall=spec_host.firewall,
+                data_value=spec_host.data_value,
+            )
+            hosts[spec_host.id] = h
+            g.add_node(spec_host.id, name=spec_host.name, ip=spec_host.ip, os=spec_host.os)
+
+        # Add edges from spec connections (bidirectional)
+        for a, b in self.spec.connections:
+            g.add_edge(a, b)
+            g.add_edge(b, a)
+
+        return g, hosts
+
+    def _find_attacker_node(self):
+        # Find the host matching attacker_entry IP
+        for spec_host in self.spec.hosts:
+            if spec_host.ip == self.spec.attacker_entry:
+                self._default_attacker = spec_host.id
+                return
+        self._default_attacker = 0
+
+    # ── Gym interface ─────────────────────────────────────────────────────────
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        # Deep copy hosts (reset status)
+        self.hosts = {}
+        for hid, h in self._base_hosts.items():
+            self.hosts[hid] = Host(
+                id=h.id, subnet=h.subnet, os=h.os, ip=h.ip,
+                services=list(h.services),
+                vulnerabilities=list(h.vulnerabilities),
+                is_critical=h.is_critical, firewall=h.firewall,
+                data_value=h.data_value,
+            )
+        self.graph = self._base_graph.copy()
+        self._attacker_node = self._default_attacker
+        self._step_count = 0
+        self._episode_info = EpisodeInfo()
+
+        self.hosts[self._attacker_node].status = HostStatus.COMPROMISED
+        self.hosts[self._attacker_node].discovered = True
+        self._episode_info.hosts_compromised = 1
+        self._episode_info.hosts_discovered = 1
+
+        return self._get_obs(), {"attacker_node": self._attacker_node, "num_hosts": len(self.hosts)}
+
+    def step(self, action: int):
+        n = len(self.spec.hosts)
+        e = self._NUM_EXPLOITS
+        action_type = ActionType(action // (n * e) % len(ActionType))
+        remainder = action % (n * e)
+        target_host = (remainder // e) % n
+        exploit_idx = remainder % e
+
+        act = Action(
+            action_type=action_type,
+            target_host=target_host,
+            exploit_id=exploit_idx,
+            source_host=self._attacker_node,
+        )
+
+        result = self._execute_action(act)
+        reward = self._compute_reward(result)
+        self._step_count += 1
+        self._episode_info.total_reward += reward
+        self._episode_info.steps = self._step_count
+        self._episode_info.action_log.append({
+            "step": self._step_count,
+            "action": act.to_dict(),
+            "result": result.to_dict(),
+            "reward": reward,
+        })
+
+        terminated = self._check_goal()
+        truncated = self._step_count >= self.env_cfg.max_steps
+        self._episode_info.goal_reached = terminated
+
+        return self._get_obs(), reward, terminated, truncated, {
+            "action_result": result.to_dict(),
+            "episode_info": self._episode_info if (terminated or truncated) else None,
+        }
+
+    def render(self, mode="ansi"):
+        lines = ["=" * 60, f"ARCA Custom Network: {self.spec.name}", "=" * 60]
+        for hid, host in self.hosts.items():
+            name = self.spec.hosts[hid].name
+            lines.append(
+                f"  [{hid:02d}] {name:<20} {host.ip:<16} {host.os:<12} "
+                f"{'🔴 PWNED' if host.status == HostStatus.COMPROMISED else '🟡 SEEN' if host.discovered else '⬛ ?'}"
+                f"  vulns={len(host.vulnerabilities)}"
+            )
+        lines.append(f"\nStep {self._step_count}/{self.env_cfg.max_steps}  "
+                     f"Reward={self._episode_info.total_reward:.1f}  "
+                     f"Compromised={self._episode_info.hosts_compromised}/{len(self.hosts)}")
+        return "\n".join(lines)
+
+    # ── Mechanics (reuse sim logic) ───────────────────────────────────────────
+
+    def _execute_action(self, act: Action) -> ActionResult:
+        target = self.hosts.get(act.target_host)
+        if target is None:
+            return ActionResult(success=False, message="Invalid target")
+        if act.action_type == ActionType.SCAN:
+            return self._do_scan(act, target)
+        elif act.action_type == ActionType.EXPLOIT:
+            return self._do_exploit(act, target)
+        elif act.action_type == ActionType.PIVOT:
+            return self._do_pivot(act, target)
+        elif act.action_type == ActionType.EXFILTRATE:
+            return self._do_exfiltrate(act, target)
+        return ActionResult(success=False, message="Unknown")
+
+    def _do_scan(self, act: Action, target: Host) -> ActionResult:
+        if not nx.has_path(self.graph, act.source_host, act.target_host):
+            return ActionResult(success=False, message="Unreachable")
+        was_new = not target.discovered
+        target.discovered = True
+        if was_new:
+            self._episode_info.hosts_discovered += 1
+        return ActionResult(success=True, discovered_hosts=[act.target_host] if was_new else [],
+                            message=f"Scanned {target.ip}: {target.os}, {len(target.vulnerabilities)} vulns")
+
+    def _do_exploit(self, act: Action, target: Host) -> ActionResult:
+        if not target.discovered or target.status == HostStatus.COMPROMISED:
+            return ActionResult(success=False, message="Not discoverable/already owned")
+        if not nx.has_path(self.graph, act.source_host, act.target_host):
+            return ActionResult(success=False, message="Unreachable")
+        if act.exploit_id < len(target.vulnerabilities):
+            vuln = target.vulnerabilities[act.exploit_id]
+            prob = vuln.get("exploit_prob", 0.5)
+            # Firewall reduces probability
+            if target.firewall:
+                prob *= 0.5
+            if self._np_rng.random() < prob:
+                target.status = HostStatus.COMPROMISED
+                self._attacker_node = act.target_host
+                self._episode_info.hosts_compromised += 1
+                cve = vuln.get("cve", "?")
+                self._episode_info.attack_path.append(
+                    f"{act.source_host}→{act.target_host}({vuln.get('name','?')}:{cve})"
+                )
+                return ActionResult(success=True, compromised_host=act.target_host,
+                                    message=f"Exploited {target.ip} via {vuln.get('name')} [{cve}]")
+        return ActionResult(success=False, message="Exploit failed")
+
+    def _do_pivot(self, act: Action, target: Host) -> ActionResult:
+        if target.status != HostStatus.COMPROMISED:
+            return ActionResult(success=False, message="Not compromised")
+        self._attacker_node = act.target_host
+        return ActionResult(success=True, message=f"Pivoted to {target.ip}")
+
+    def _do_exfiltrate(self, act: Action, target: Host) -> ActionResult:
+        if target.status != HostStatus.COMPROMISED:
+            return ActionResult(success=False, message="Not compromised")
+        return ActionResult(success=True, data_exfiltrated=target.data_value,
+                            message=f"Exfiltrated {target.data_value:.1f} units from {target.ip}")
+
+    def _compute_reward(self, result: ActionResult) -> float:
+        if not result.success:
+            return self.env_cfg.reward_step
+        r = 0.0
+        if result.discovered_hosts:
+            r += self.env_cfg.reward_discovery * len(result.discovered_hosts)
+        if result.compromised_host is not None:
+            h = self.hosts[result.compromised_host]
+            bonus = 2.0 if h.is_critical else 1.0
+            r += self.env_cfg.reward_exploit * bonus
+        if result.data_exfiltrated > 0:
+            r += result.data_exfiltrated * 2.0
+        r += self.env_cfg.reward_step
+        return r
+
+    def _check_goal(self) -> bool:
+        n = sum(1 for h in self.hosts.values() if h.status == HostStatus.COMPROMISED)
+        return n >= max(3, len(self.hosts) // 2)
+
+    def _get_obs(self) -> np.ndarray:
+        n = len(self.spec.hosts)
+        obs = np.zeros(n * self._HOST_FEATURES, dtype=np.float32)
+        os_map = {"Windows": 0, "Linux": 1, "macOS": 2, "IoT": 3, "Router": 3, "Android": 2, "Windows Server": 0}
+        for i in range(n):
+            host = self.hosts.get(i)
+            if host is None:
+                continue
+            base = i * self._HOST_FEATURES
+            obs[base + 0] = float(host.discovered)
+            obs[base + 1] = float(host.status == HostStatus.COMPROMISED)
+            obs[base + 2 + os_map.get(host.os, 0)] = 1.0
+            obs[base + 6] = host.subnet / max(self.env_cfg.num_subnets, 1)
+            obs[base + 7] = len(host.vulnerabilities) / 10.0
+            obs[base + 8] = len(host.services) / 10.0
+        return obs
+
+    # ── Introspection ─────────────────────────────────────────────────────────
+
+    @property
+    def episode_info(self) -> EpisodeInfo:
+        return self._episode_info
+
+    def get_network_graph(self) -> nx.DiGraph:
+        return self.graph
+
+    def get_hosts(self) -> dict[int, Host]:
+        return self.hosts
+
+    def get_state_dict(self) -> dict:
+        return {
+            "step": self._step_count,
+            "attacker_node": self._attacker_node,
+            "network_name": self.spec.name,
+            "hosts": {
+                hid: {
+                    **h.to_dict(),
+                    "name": self.spec.hosts[hid].name,
+                    "notes": self.spec.hosts[hid].notes,
+                }
+                for hid, h in self.hosts.items()
+            },
+            "episode_info": {
+                "total_reward": self._episode_info.total_reward,
+                "hosts_compromised": self._episode_info.hosts_compromised,
+                "hosts_discovered": self._episode_info.hosts_discovered,
+                "attack_path": self._episode_info.attack_path,
+            },
+        }
+
+    def print_cve_library(self):
+        """Helper: show all available CVEs for YAML authoring."""
+        print("\nAvailable CVEs for your YAML topology:")
+        print(f"{'Name':<20} {'CVE':<18} {'Prob':>5}  {'Severity':<10} {'OS'}")
+        print("-" * 75)
+        for name, info in CVE_LIBRARY.items():
+            print(f"{name:<20} {info['cve']:<18} {info['exploit_prob']:>5.0%}  {info['severity']:<10} {', '.join(info['os'])}")
+
+
+# ── YAML Templates ────────────────────────────────────────────────────────────
+
+HOME_NETWORK_TEMPLATE = """\
+# =====================================================
+# ARCA Custom Network — Home Network Template
+# =====================================================
+# Edit this file to describe your real network layout.
+# Run: from arca.sim.custom_network import CustomNetworkBuilder
+#      env = CustomNetworkBuilder.from_yaml("this_file.yaml")
+# =====================================================
+
+name: "My Home Network"
+description: "Typical home network with router, laptops, IoT devices"
+attacker_entry: "192.168.1.1"   # The host ARCA starts from (your entry point / "attacker foothold")
+
+# Available OS types: Windows, Linux, macOS, IoT, Router, Android, "Windows Server"
+# Available CVEs: EternalBlue, BlueKeep, Log4Shell, Shellshock, Heartbleed, IoTDefaultCreds,
+#                 PwnKit, Spring4Shell, PrintNightmare, ZeroLogon, RouterDefaultPwd, SQLInjection
+
+hosts:
+  - name: "Home Router"
+    os: Router
+    subnet: 0
+    ip: "192.168.1.1"
+    services: [HTTP, HTTPS, SSH, Telnet]
+    vulns: [RouterDefaultPwd]
+    firewall: false
+    data_value: 3.0
+    notes: "ISP-provided router, default credentials likely unchanged"
+
+  - name: "Dad's Laptop"
+    os: Windows
+    subnet: 1
+    ip: "192.168.1.10"
+    services: [SMB, RDP, HTTP]
+    vulns: [EternalBlue, BlueKeep]
+    is_critical: false
+    data_value: 8.0
+    notes: "Runs Windows 10, rarely updated"
+
+  - name: "Mom's MacBook"
+    os: macOS
+    subnet: 1
+    ip: "192.168.1.11"
+    services: [SSH, HTTP, AFP]
+    vulns: [TCC_Bypass]
+    data_value: 6.0
+
+  - name: "Smart TV"
+    os: IoT
+    subnet: 2
+    ip: "192.168.1.30"
+    services: [HTTP, MQTT]
+    vulns: [IoTDefaultCreds]
+    data_value: 2.0
+
+  - name: "NAS Server"
+    os: Linux
+    subnet: 1
+    ip: "192.168.1.20"
+    services: [SSH, HTTP, FTP, NFS]
+    vulns: [Log4Shell, DirtyCOW]
+    is_critical: true
+    data_value: 15.0
+    notes: "Family photos and important documents — HIGH VALUE TARGET"
+
+  - name: "Smart Camera"
+    os: IoT
+    subnet: 2
+    ip: "192.168.1.31"
+    services: [HTTP, Telnet, RTSP]
+    vulns: [IoTDefaultCreds, RouteRCE]
+    data_value: 4.0
+
+# Define which hosts can reach each other.
+# Format: [host_id_a, host_id_b]  (bidirectional)
+# host IDs are 0-indexed in the order listed above
+connections:
+  - [0, 1]   # Router <-> Dad's Laptop
+  - [0, 2]   # Router <-> Mom's MacBook
+  - [0, 3]   # Router <-> Smart TV
+  - [0, 4]   # Router <-> NAS
+  - [0, 5]   # Router <-> Smart Camera
+  - [1, 4]   # Dad's Laptop <-> NAS (file sharing)
+  - [2, 4]   # Mom's MacBook <-> NAS
+
+subnet_names:
+  0: "DMZ / Router"
+  1: "Trusted LAN"
+  2: "IoT VLAN"
+"""
+
+SMALL_OFFICE_TEMPLATE = """\
+name: "Small Office Network"
+description: "10-person startup office with shared server and cloud access"
+attacker_entry: "10.0.0.1"
+
+hosts:
+  - name: "Edge Router"
+    os: Router
+    subnet: 0
+    ip: "10.0.0.1"
+    services: [HTTP, HTTPS, SSH]
+    vulns: [RouterDefaultPwd, Cisco_CVE]
+    firewall: true
+    data_value: 5.0
+
+  - name: "Web Server"
+    os: Linux
+    subnet: 0
+    ip: "10.0.0.10"
+    services: [HTTP, HTTPS, SSH]
+    vulns: [Log4Shell, Spring4Shell, SQLInjection]
+    data_value: 10.0
+    notes: "Public-facing web server — likely initial attack surface"
+
+  - name: "File Server"
+    os: "Windows Server"
+    subnet: 1
+    ip: "10.0.1.5"
+    services: [SMB, RDP, IIS]
+    vulns: [EternalBlue, PrintNightmare, ZeroLogon]
+    is_critical: true
+    data_value: 20.0
+
+  - name: "Dev Laptop"
+    os: macOS
+    subnet: 1
+    ip: "10.0.1.20"
+    services: [SSH, HTTP]
+    vulns: [TCC_Bypass]
+    data_value: 12.0
+
+  - name: "HR Laptop"
+    os: Windows
+    subnet: 1
+    ip: "10.0.1.21"
+    services: [SMB, RDP]
+    vulns: [BlueKeep, EternalBlue]
+    is_critical: true
+    data_value: 18.0
+    notes: "Contains sensitive employee records"
+
+  - name: "Printer"
+    os: IoT
+    subnet: 2
+    ip: "10.0.2.1"
+    services: [HTTP, SNMP]
+    vulns: [IoTDefaultCreds]
+    data_value: 2.0
+
+connections:
+  - [0, 1]   # Router <-> Web Server
+  - [0, 2]   # Router <-> File Server
+  - [1, 2]   # Web Server <-> File Server
+  - [2, 3]   # File Server <-> Dev Laptop
+  - [2, 4]   # File Server <-> HR Laptop
+  - [0, 5]   # Router <-> Printer
+  - [2, 5]   # File Server <-> Printer
+
+subnet_names:
+  0: "DMZ"
+  1: "Internal LAN"
+  2: "Peripherals"
+"""
+
+DATACENTER_TEMPLATE = """\
+name: "Mini Datacenter"
+description: "Small datacenter with web tier, app tier, DB tier"
+attacker_entry: "172.16.0.1"
+
+hosts:
+  - name: "Firewall"
+    os: Router
+    subnet: 0
+    ip: "172.16.0.1"
+    services: [SSH, HTTP]
+    vulns: [RouterDefaultPwd]
+    firewall: true
+    data_value: 5.0
+
+  - name: "Load Balancer"
+    os: Linux
+    subnet: 0
+    ip: "172.16.0.2"
+    services: [HTTP, HTTPS]
+    vulns: [Shellshock]
+    data_value: 8.0
+
+  - name: "Web App 1"
+    os: Linux
+    subnet: 1
+    ip: "172.16.1.10"
+    services: [HTTP, SSH]
+    vulns: [Log4Shell, RCE_WebApp]
+    data_value: 10.0
+
+  - name: "Web App 2"
+    os: Linux
+    subnet: 1
+    ip: "172.16.1.11"
+    services: [HTTP, SSH]
+    vulns: [Spring4Shell]
+    data_value: 10.0
+
+  - name: "App Server"
+    os: Linux
+    subnet: 2
+    ip: "172.16.2.5"
+    services: [SSH, HTTP, PostgreSQL]
+    vulns: [PwnKit, DirtyCOW]
+    is_critical: true
+    data_value: 15.0
+
+  - name: "Primary DB"
+    os: Linux
+    subnet: 3
+    ip: "172.16.3.1"
+    services: [PostgreSQL, SSH]
+    vulns: [Heartbleed, SQLInjection]
+    is_critical: true
+    data_value: 25.0
+    notes: "Crown jewel — production database"
+
+  - name: "Backup DB"
+    os: Linux
+    subnet: 3
+    ip: "172.16.3.2"
+    services: [PostgreSQL, SSH]
+    vulns: [Heartbleed]
+    is_critical: true
+    data_value: 20.0
+
+connections:
+  - [0, 1]   # Firewall <-> LB
+  - [1, 2]   # LB <-> Web1
+  - [1, 3]   # LB <-> Web2
+  - [2, 4]   # Web1 <-> App
+  - [3, 4]   # Web2 <-> App
+  - [4, 5]   # App <-> Primary DB
+  - [5, 6]   # Primary DB <-> Backup DB
+
+subnet_names:
+  0: "Edge"
+  1: "Web Tier"
+  2: "App Tier"
+  3: "DB Tier"
+"""
+
+
+
 # File: arca/sim/environment.py
 # ================================================
 """
@@ -1857,31 +2630,14 @@ __all__ = ["ARCAOrchestrator", "ARCAGraphState"]
 # ================================================
 """
 arca.agents.langgraph_orchestrator
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-LangGraph-based multi-agent system for explainable RL decision-making.
-
-Graph topology:
-  ┌──────────────┐
-  │  State Input │
-  └──────┬───────┘
-         ▼
-  ┌──────────────┐    ┌────────────────┐
-  │  Analyst     │───▶│  Critic        │
-  │  (describes  │    │  (evaluates    │
-  │   state)     │    │   RL action)   │
-  └──────────────┘    └───────┬────────┘
-                              ▼
-                     ┌────────────────┐
-                     │  Reflector     │
-                     │  (learns from  │
-                     │   mistakes)    │
-                     └───────┬────────┘
-                             ▼
-                     ┌────────────────┐
-                     │  Planner       │
-                     │  (suggests     │
-                     │   next steps)  │
-                     └────────────────┘
+===================================
+Improved LangGraph multi-agent system with:
+  - Proper multi-provider LLM (Ollama / Groq / Anthropic / OpenAI / rule-based)
+  - Rich, context-aware prompts using full host details
+  - 5-node graph: Analyst → Attacker → Critic → Reflector → Planner
+  - Remediation node: generates defender's patch recommendations
+  - Persistent memory across episodes
+  - Structured output with severity scoring
 """
 
 from __future__ import annotations
@@ -1892,154 +2648,324 @@ from typing import Any, TypedDict, Optional
 from arca.core.config import ARCAConfig
 
 
+# ── Graph state ───────────────────────────────────────────────────────────────
+
 class ARCAGraphState(TypedDict):
     network_state: dict
     analyst_output: str
+    attacker_output: str
     critic_output: str
     reflection: str
     plan: str
+    remediation: str
+    severity_score: float       # 0.0–10.0 CVSS-like overall risk
     episode_history: list[dict]
 
 
+# ── Orchestrator ──────────────────────────────────────────────────────────────
+
 class ARCAOrchestrator:
     """
-    LangGraph-powered orchestrator with LLM nodes.
-    Falls back to rule-based heuristics if LLM is unavailable.
+    LangGraph multi-agent orchestrator.
+
+    Nodes:
+      analyst    — describes current network state in plain English
+      attacker   — suggests optimal next exploit moves
+      critic     — evaluates agent efficiency, finds weaknesses
+      reflector  — extracts lessons for future episodes
+      planner    — generates structured action plan
+      remediator — provides defender patch recommendations (bonus node)
+
+    LLM providers auto-detected in order:
+      Ollama → Groq → Anthropic → OpenAI → Rule-based fallback
     """
 
-    def __init__(self, cfg: Optional[ARCAConfig] = None):
+    def __init__(
+        self,
+        cfg: Optional[ARCAConfig] = None,
+        provider: Optional[str] = None,    # "auto" | "ollama" | "groq" | "anthropic" | "openai" | "rule"
+        model: Optional[str] = None,
+    ):
         self.cfg = cfg or ARCAConfig()
-        self._llm = None
-        self._graph = None
         self._memory: list[dict] = []
-        self._llm_available = False
+        self._graph = None
 
-        if self.cfg.llm.enabled:
-            self._init_llm()
-            if self._llm_available:
-                self._build_graph()
+        # Init LLM provider
+        from arca.llm.providers import auto_detect_provider
+        self._provider = auto_detect_provider(
+            preferred=provider or self.cfg.llm.provider or "auto",
+            model=model or self.cfg.llm.model or None,
+        )
+        self._llm_available = not self._provider.name.startswith("rule")
+        print(f"[ARCA] LLM provider: {self._provider.name} "
+              f"({'✓ connected' if self._llm_available else '⚠ rule-based fallback'})")
 
-    def _init_llm(self) -> None:
-        try:
-            from langchain_community.llms import Ollama  # type: ignore
-            self._llm = Ollama(
-                model=self.cfg.llm.model,
-                base_url=self.cfg.llm.base_url,
-                temperature=self.cfg.llm.temperature,
-            )
-            # Quick connectivity test
-            self._llm.invoke("ping")
-            self._llm_available = True
-            print(f"[ARCA] LLM connected: {self.cfg.llm.model} @ {self.cfg.llm.base_url}")
-        except Exception as e:
-            print(f"[ARCA] LLM unavailable ({e}). Using rule-based fallback.")
-            self._llm_available = False
+        self._build_graph()
+
+    # ── Graph construction ────────────────────────────────────────────────────
 
     def _build_graph(self) -> None:
         try:
-            from langgraph.graph import StateGraph, END  # type: ignore
+            from langgraph.graph import StateGraph, END
 
             graph = StateGraph(ARCAGraphState)
-            graph.add_node("analyst", self._analyst_node)
-            graph.add_node("critic", self._critic_node)
-            graph.add_node("reflector", self._reflector_node)
-            graph.add_node("planner", self._planner_node)
+            graph.add_node("analyst",    self._analyst_node)
+            graph.add_node("attacker",   self._attacker_node)
+            graph.add_node("critic",     self._critic_node)
+            graph.add_node("reflector",  self._reflector_node)
+            graph.add_node("planner",    self._planner_node)
+            graph.add_node("remediator", self._remediator_node)
 
             graph.set_entry_point("analyst")
-            graph.add_edge("analyst", "critic")
-            graph.add_edge("critic", "reflector")
+            graph.add_edge("analyst",   "attacker")
+            graph.add_edge("attacker",  "critic")
+            graph.add_edge("critic",    "reflector")
             graph.add_edge("reflector", "planner")
-            graph.add_edge("planner", END)
+            graph.add_edge("planner",   "remediator")
+            graph.add_edge("remediator", END)
 
             self._graph = graph.compile()
         except Exception as e:
-            print(f"[ARCA] LangGraph build failed: {e}. Using sequential fallback.")
+            print(f"[ARCA] LangGraph build failed ({e}). Sequential fallback active.")
             self._graph = None
 
-    # ------------------------------------------------------------------
-    # Node implementations
-    # ------------------------------------------------------------------
+    # ── Node implementations ──────────────────────────────────────────────────
 
     def _analyst_node(self, state: ARCAGraphState) -> ARCAGraphState:
         ns = state["network_state"]
-        prompt = f"""You are a cybersecurity analyst examining a network penetration test.
+        hosts = ns.get("hosts", {})
+        ep = ns.get("episode_info", {})
 
-Current network state:
-- Step: {ns.get('step', 0)}
-- Attacker position: Host {ns.get('attacker_node', 0)}
-- Hosts discovered: {sum(1 for h in ns.get('hosts', {}).values() if h.get('discovered'))}
-- Hosts compromised: {sum(1 for h in ns.get('hosts', {}).values() if h.get('status') == 'COMPROMISED')}
-- Total hosts: {len(ns.get('hosts', {}))}
-- Attack path so far: {ns.get('episode_info', {}).get('attack_path', [])}
+        compromised = [
+            f"Host {hid} ({h.get('name', h.get('ip', hid))}, {h.get('os')})"
+            for hid, h in hosts.items() if h.get("status") == "COMPROMISED"
+        ]
+        discovered = [
+            f"Host {hid} ({h.get('name', h.get('ip', hid))}, {h.get('os')}, vulns: {h.get('vulnerabilities', [])})"
+            for hid, h in hosts.items() if h.get("discovered") and h.get("status") != "COMPROMISED"
+        ]
+        undiscovered_count = sum(1 for h in hosts.values() if not h.get("discovered"))
 
-Briefly describe the current attack situation in 2-3 sentences."""
+        prompt = f"""You are a senior cybersecurity analyst reviewing a penetration test in progress.
 
-        output = self._invoke_llm(prompt) or self._rule_based_analyst(ns)
+NETWORK: {ns.get('network_name', 'Unknown')}
+STEP: {ns.get('step', 0)}
+ATTACKER POSITION: Host {ns.get('attacker_node', 0)} — {hosts.get(str(ns.get('attacker_node', 0)), {}).get('ip', 'unknown')}
+
+COMPROMISED HOSTS ({len(compromised)}):
+{chr(10).join(f'  ✓ {c}' for c in compromised) or '  None yet'}
+
+DISCOVERED (not yet compromised) ({len(discovered)}):
+{chr(10).join(f'  ~ {d}' for d in discovered[:5]) or '  None yet'}
+
+UNDISCOVERED: {undiscovered_count} hosts
+TOTAL REWARD: {ep.get('total_reward', 0):.1f}
+ATTACK PATH: {' → '.join(ep.get('attack_path', [])) or 'None yet'}
+
+In 3 sentences: describe the current attack situation, what the attacker controls, and what the most valuable remaining targets are."""
+
+        output = self._llm_call(prompt) or self._rule_analyst(ns)
         state["analyst_output"] = output
+
+        # Compute severity score (0-10)
+        total = max(len(hosts), 1)
+        comp = len(compromised)
+        crit_comp = sum(1 for h in hosts.values()
+                        if h.get("status") == "COMPROMISED" and h.get("is_critical"))
+        state["severity_score"] = min(10.0, round(
+            (comp / total) * 5.0 + crit_comp * 2.5 + (1 if len(ep.get("attack_path", [])) > 0 else 0), 1
+        ))
+        return state
+
+    def _attacker_node(self, state: ARCAGraphState) -> ARCAGraphState:
+        ns = state["network_state"]
+        hosts = ns.get("hosts", {})
+
+        # Build rich host table
+        host_lines = []
+        for hid, h in hosts.items():
+            vulns = h.get("vulnerabilities", [])
+            vuln_str = ", ".join(f"{v if isinstance(v, str) else v.get('name','?')}({v.get('exploit_prob',0.5)*100:.0f}%)" if isinstance(v, dict) else v for v in vulns[:3])
+            host_lines.append(
+                f"  [{hid}] {h.get('ip','?'):<16} {h.get('os','?'):<10} "
+                f"{'COMPROMISED' if h.get('status')=='COMPROMISED' else 'DISCOVERED' if h.get('discovered') else 'UNKNOWN':<12} "
+                f"critical={h.get('is_critical',False)} firewall={h.get('firewall',False)} "
+                f"vulns=[{vuln_str}]"
+            )
+
+        prompt = f"""You are a penetration tester AI planning the next move.
+
+{state.get('analyst_output', '')}
+
+DETAILED HOST STATUS:
+{chr(10).join(host_lines)}
+
+CURRENT POSITION: Host {ns.get('attacker_node', 0)}
+
+As the attacker, identify:
+1. The single best next exploit (highest probability, most impactful)
+2. Best pivot path to reach critical/high-value hosts
+3. Any quick wins (firewall=false + high exploit_prob)
+
+Be specific: name the target host ID, the CVE/vuln, and why it's the best move."""
+
+        output = self._llm_call(prompt) or self._rule_attacker(ns)
+        state["attacker_output"] = output
         return state
 
     def _critic_node(self, state: ARCAGraphState) -> ARCAGraphState:
         ns = state["network_state"]
-        analyst = state.get("analyst_output", "")
-        prompt = f"""You are a cybersecurity critic reviewing an RL agent's decisions.
+        ep = ns.get("episode_info", {})
+        hosts = ns.get("hosts", {})
 
-Situation: {analyst}
+        comp = ep.get("hosts_compromised", 0)
+        disc = ep.get("hosts_discovered", 0)
+        total = len(hosts)
+        steps = ns.get("step", 1)
+        reward = ep.get("total_reward", 0)
 
-Recent reward: {ns.get('episode_info', {}).get('total_reward', 0):.2f}
+        efficiency = comp / max(steps, 1) * 100
+        discovery_ratio = disc / max(total, 1)
+        exploit_ratio = comp / max(disc, 1) if disc > 0 else 0
 
-Critically evaluate:
-1. Is the agent making good use of discovered hosts?
-2. Is it being efficient in its attack path?
-3. What mistakes is it making?
+        prompt = f"""You are a red team exercise evaluator critiquing an RL agent's performance.
 
-Be concise (2-3 sentences)."""
+PERFORMANCE METRICS:
+  Steps taken: {steps}
+  Hosts discovered: {disc}/{total} ({discovery_ratio*100:.0f}%)
+  Hosts compromised: {comp}/{total} ({comp/total*100:.0f}%)
+  Exploit success rate: {exploit_ratio*100:.0f}% (of discovered)
+  Actions per compromise: {steps/max(comp,1):.1f}
+  Total reward: {reward:.1f}
+  Efficiency score: {efficiency:.2f} compromises/100 steps
 
-        output = self._invoke_llm(prompt) or self._rule_based_critic(ns)
+ANALYST ASSESSMENT: {state.get('analyst_output', '')[:200]}
+ATTACKER PLAN: {state.get('attacker_output', '')[:200]}
+
+Critique in 3 points:
+1. What is the agent doing wrong / inefficiently?
+2. What opportunities is it missing?
+3. What is the risk level for the defender? (Low/Medium/High/Critical)"""
+
+        output = self._llm_call(prompt) or self._rule_critic(ns)
         state["critic_output"] = output
         return state
 
     def _reflector_node(self, state: ARCAGraphState) -> ARCAGraphState:
-        critic = state.get("critic_output", "")
         history = state.get("episode_history", [])
-        prompt = f"""You are a reflection module for an RL agent learning pentesting.
+        recent = history[-3:] if history else []
+        hist_str = "\n".join(
+            f"  Episode {i+1}: comp={h.get('compromised',0)}, steps={h.get('steps',0)}, reward={h.get('reward',0):.1f}"
+            for i, h in enumerate(recent)
+        ) if recent else "  No previous episodes"
 
-Critic feedback: {critic}
-Past reflections: {history[-3:] if history else 'None'}
+        prompt = f"""You are an RL training coach analyzing an agent's learning progress.
 
-What should the agent learn from this? What patterns should it avoid or repeat?
-Be specific and actionable (1-2 sentences)."""
+CURRENT EPISODE CRITIQUE:
+{state.get('critic_output', '')[:300]}
 
-        output = self._invoke_llm(prompt) or "Agent should prioritize scanning before exploiting."
+RECENT EPISODE HISTORY:
+{hist_str}
+
+SEVERITY SCORE: {state.get('severity_score', 0)}/10
+
+Provide 2 key lessons:
+1. What behavioral pattern should the agent reinforce?
+2. What behavior should it avoid in future episodes?
+
+Be specific and actionable (max 2 sentences each)."""
+
+        output = self._llm_call(prompt) or "1. Scan before exploit. 2. Prioritize critical hosts."
         state["reflection"] = output
         return state
 
     def _planner_node(self, state: ARCAGraphState) -> ARCAGraphState:
         ns = state["network_state"]
-        reflection = state.get("reflection", "")
-        prompt = f"""You are a penetration testing planner.
+        hosts = ns.get("hosts", {})
 
-Reflection: {reflection}
-Current position: Host {ns.get('attacker_node', 0)}
-Compromised hosts: {[hid for hid, h in ns.get('hosts', {}).items() if h.get('status') == 'COMPROMISED']}
+        # Find best targets
+        undiscovered = [hid for hid, h in hosts.items() if not h.get("discovered")]
+        exploitable = [
+            (hid, h) for hid, h in hosts.items()
+            if h.get("discovered") and h.get("status") != "COMPROMISED"
+        ]
+        # Sort exploitable by highest exploit prob
+        if exploitable:
+            def best_prob(item):
+                vulns = item[1].get("vulnerabilities", [])
+                return max((v.get("exploit_prob", 0) if isinstance(v, dict) else 0.5
+                            for v in vulns), default=0)
+            exploitable.sort(key=best_prob, reverse=True)
 
-Suggest the next 3 high-priority actions for the RL agent (SCAN/EXPLOIT/PIVOT/EXFILTRATE).
-Format: action: target_host reason"""
+        critical_unowned = [
+            hid for hid, h in hosts.items()
+            if h.get("is_critical") and h.get("status") != "COMPROMISED"
+        ]
 
-        output = self._invoke_llm(prompt) or self._rule_based_plan(ns)
+        prompt = f"""You are a penetration testing planner creating a concrete action sequence.
+
+REFLECTION: {state.get('reflection', '')[:200]}
+ATTACKER INSIGHTS: {state.get('attacker_output', '')[:200]}
+
+AVAILABLE TARGETS:
+  Undiscovered hosts: {undiscovered[:5]}
+  Exploitable (discovered): {[h for h, _ in exploitable[:5]]}
+  Critical targets not yet owned: {critical_unowned}
+
+Generate a prioritized action plan with exactly 5 steps.
+Format each step as:
+  STEP N: [ACTION] on Host [ID] — [reason and expected outcome]
+
+Actions: SCAN | EXPLOIT | PIVOT | EXFILTRATE"""
+
+        output = self._llm_call(prompt) or self._rule_plan(ns)
         state["plan"] = output
         return state
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+    def _remediator_node(self, state: ARCAGraphState) -> ARCAGraphState:
+        ns = state["network_state"]
+        hosts = ns.get("hosts", {})
+        ep = ns.get("episode_info", {})
+
+        # Gather all exploited vulnerabilities
+        attack_path = ep.get("attack_path", [])
+        compromised_details = [
+            f"  - {h.get('ip','?')} ({h.get('os','?')}): vulns={h.get('vulnerabilities',[])}"
+            for hid, h in hosts.items() if h.get("status") == "COMPROMISED"
+        ]
+
+        prompt = f"""You are a defensive security engineer (blue team) analyzing a completed penetration test.
+
+ATTACK PATH: {' → '.join(attack_path) or 'No successful exploits'}
+SEVERITY SCORE: {state.get('severity_score', 0)}/10
+COMPROMISED HOSTS:
+{chr(10).join(compromised_details) or '  None'}
+
+Generate a prioritized remediation report with:
+1. CRITICAL (fix within 24h): Patch or mitigate most dangerous vulnerabilities
+2. HIGH (fix within 1 week): Network segmentation and access controls
+3. MEDIUM (fix within 1 month): Monitoring, logging, credential hygiene
+4. QUICK WINS: Immediate low-effort improvements (firewall rules, default creds)
+
+Be specific — name CVEs, suggest exact patches or config changes."""
+
+        output = self._llm_call(prompt) or self._rule_remediation(ns)
+        state["remediation"] = output
+        return state
+
+    # ── Public interface ──────────────────────────────────────────────────────
 
     def step(self, network_state: dict) -> dict:
+        """Run full analysis graph on current network state."""
         initial_state: ARCAGraphState = {
             "network_state": network_state,
             "analyst_output": "",
+            "attacker_output": "",
             "critic_output": "",
             "reflection": "",
             "plan": "",
+            "remediation": "",
+            "severity_score": 0.0,
             "episode_history": self._memory[-5:],
         }
 
@@ -2047,15 +2973,22 @@ Format: action: target_host reason"""
             result = self._graph.invoke(initial_state)
         else:
             # Sequential fallback
-            result = self._analyst_node(initial_state)
-            result = self._critic_node(result)
-            result = self._reflector_node(result)
-            result = self._planner_node(result)
+            result = initial_state.copy()
+            for node in [
+                self._analyst_node, self._attacker_node, self._critic_node,
+                self._reflector_node, self._planner_node, self._remediator_node,
+            ]:
+                result = node(result)
 
+        # Store in memory
+        ep = network_state.get("episode_info", {})
         self._memory.append({
             "step": network_state.get("step"),
-            "reflection": result.get("reflection"),
-            "plan": result.get("plan"),
+            "compromised": ep.get("hosts_compromised", 0),
+            "steps": network_state.get("step", 0),
+            "reward": ep.get("total_reward", 0),
+            "severity": result.get("severity_score", 0),
+            "reflection": result.get("reflection", ""),
         })
 
         return result
@@ -2066,52 +2999,106 @@ Format: action: target_host reason"""
     def get_memory(self) -> list[dict]:
         return self._memory
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    def get_provider_name(self) -> str:
+        return self._provider.name
 
-    def _invoke_llm(self, prompt: str) -> Optional[str]:
-        if not self._llm_available or self._llm is None:
-            return None
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _llm_call(self, prompt: str) -> Optional[str]:
         try:
-            return self._llm.invoke(prompt)
-        except Exception:
-            return None
+            result = self._provider.complete(prompt, max_tokens=self.cfg.llm.max_tokens)
+            if result and len(result) > 10:
+                return result
+        except Exception as e:
+            print(f"[ARCA] LLM call failed: {e}. Using rule-based.")
+        return None
 
-    def _rule_based_analyst(self, ns: dict) -> str:
-        comp = sum(1 for h in ns.get("hosts", {}).values() if h.get("status") == "COMPROMISED")
-        disc = sum(1 for h in ns.get("hosts", {}).values() if h.get("discovered"))
-        total = len(ns.get("hosts", {}))
+    def _rule_analyst(self, ns: dict) -> str:
+        hosts = ns.get("hosts", {})
+        ep = ns.get("episode_info", {})
+        comp = ep.get("hosts_compromised", 0)
+        disc = ep.get("hosts_discovered", 0)
+        total = len(hosts)
+        critical_owned = sum(1 for h in hosts.values()
+                             if h.get("status") == "COMPROMISED" and h.get("is_critical"))
         return (
-            f"Agent has compromised {comp}/{total} hosts and discovered {disc}/{total}. "
-            f"Currently operating from host {ns.get('attacker_node', 0)}. "
-            f"Progress: {comp/max(total,1)*100:.0f}% of objective achieved."
+            f"Agent controls {comp}/{total} hosts ({disc} discovered) "
+            f"from position Host {ns.get('attacker_node', 0)}. "
+            f"Critical hosts owned: {critical_owned}. "
+            f"Progress: {comp/max(total,1)*100:.0f}% network penetration."
         )
 
-    def _rule_based_critic(self, ns: dict) -> str:
-        comp = sum(1 for h in ns.get("hosts", {}).values() if h.get("status") == "COMPROMISED")
-        disc = sum(1 for h in ns.get("hosts", {}).values() if h.get("discovered"))
+    def _rule_attacker(self, ns: dict) -> str:
+        hosts = ns.get("hosts", {})
+        best_target = None
+        best_prob = 0
+        for hid, h in hosts.items():
+            if h.get("discovered") and h.get("status") != "COMPROMISED":
+                for v in h.get("vulnerabilities", []):
+                    p = v.get("exploit_prob", 0) if isinstance(v, dict) else 0.5
+                    if p > best_prob and not h.get("firewall", False):
+                        best_prob = p
+                        best_target = (hid, h, v)
+        if best_target:
+            hid, h, v = best_target
+            return f"Best target: Host {hid} ({h.get('ip')}) via {v.get('name','?')} ({best_prob*100:.0f}% success rate)."
+        return "All reachable hosts discovered. Focus on pivoting to new subnets."
+
+    def _rule_critic(self, ns: dict) -> str:
+        ep = ns.get("episode_info", {})
+        comp = ep.get("hosts_compromised", 0)
+        disc = ep.get("hosts_discovered", 0)
+        total = len(ns.get("hosts", {}))
         if disc == 0:
-            return "Agent should scan more aggressively to discover hosts before exploiting."
+            return "1. No hosts discovered. 2. Agent not scanning. 3. Risk: Low (no penetration)."
         ratio = comp / max(disc, 1)
         if ratio < 0.3:
-            return "Low exploit ratio. Agent discovers hosts but fails to compromise them efficiently."
-        return "Agent is making reasonable progress. Consider pivoting to reach deeper subnets."
+            return (
+                "1. Low exploit success — agent discovering but not compromising. "
+                "2. Missing high-probability vulns. "
+                "3. Risk: Medium."
+            )
+        return (
+            f"1. Reasonable progress ({comp}/{total} hosts). "
+            "2. Should target critical hosts next. "
+            "3. Risk: High — attacker has significant foothold."
+        )
 
-    def _rule_based_plan(self, ns: dict) -> str:
+    def _rule_plan(self, ns: dict) -> str:
         hosts = ns.get("hosts", {})
         undiscovered = [hid for hid, h in hosts.items() if not h.get("discovered")]
-        exploitable = [
-            hid for hid, h in hosts.items()
-            if h.get("discovered") and h.get("status") != "COMPROMISED"
-        ]
-        plan_parts = []
+        exploitable = [hid for hid, h in hosts.items()
+                       if h.get("discovered") and h.get("status") != "COMPROMISED"]
+        critical = [hid for hid, h in hosts.items()
+                    if h.get("is_critical") and h.get("status") != "COMPROMISED"]
+        steps = []
         if undiscovered:
-            plan_parts.append(f"SCAN: target host {undiscovered[0]} — discover new hosts")
+            steps.append(f"STEP 1: SCAN Host {undiscovered[0]} — discover new hosts in network")
         if exploitable:
-            plan_parts.append(f"EXPLOIT: target host {exploitable[0]} — compromise vulnerable host")
-        plan_parts.append("PIVOT: move to highest-value compromised host for better reach")
-        return "\n".join(plan_parts)
+            steps.append(f"STEP 2: EXPLOIT Host {exploitable[0]} — compromise discovered host")
+        if critical:
+            steps.append(f"STEP 3: EXPLOIT Host {critical[0]} (CRITICAL) — high-value target")
+        if exploitable:
+            steps.append(f"STEP 4: PIVOT to compromised host — expand attack surface")
+        steps.append("STEP 5: EXFILTRATE from highest data_value compromised host")
+        return "\n".join(steps) if steps else "STEP 1: SCAN all reachable hosts"
+
+    def _rule_remediation(self, ns: dict) -> str:
+        hosts = ns.get("hosts", {})
+        compromised_vulns = []
+        for h in hosts.values():
+            if h.get("status") == "COMPROMISED":
+                for v in h.get("vulnerabilities", []):
+                    if isinstance(v, dict):
+                        compromised_vulns.append(v.get("name", "unknown"))
+
+        vuln_str = ", ".join(set(compromised_vulns[:5])) if compromised_vulns else "None identified"
+        return (
+            f"CRITICAL (24h): Patch {vuln_str}. Apply emergency security updates.\n"
+            "HIGH (1 week): Enable host firewall on all endpoints. Segment IoT to separate VLAN.\n"
+            "MEDIUM (1 month): Deploy SIEM, enable audit logging, enforce MFA.\n"
+            "QUICK WINS: Change all default credentials, disable Telnet/unused services."
+        )
 
 
 
@@ -3182,6 +4169,286 @@ if __name__ == "__main__":
 
 
 
+# File: examples/test_my_network.py
+# ================================================
+#!/usr/bin/env python3
+"""
+examples/test_my_network.py
+============================
+Complete end-to-end example: test ARCA on YOUR OWN custom network.
+
+Run:
+    python examples/test_my_network.py
+
+This script:
+  1. Generates a home network YAML template
+  2. Builds a custom network environment from it
+  3. Trains a PPO agent against it
+  4. Runs a full security audit
+  5. Gets LLM analysis (auto-detects: Ollama → Groq → rule-based)
+  6. Prints remediation recommendations
+  7. Generates HTML visualizations
+"""
+
+from __future__ import annotations
+import sys
+import os
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+def banner(msg: str, char: str = "="):
+    width = 65
+    print(f"\n{char * width}")
+    print(f"  {msg}")
+    print(f"{char * width}")
+
+
+def section(msg: str):
+    print(f"\n  ▶ {msg}")
+
+
+# ── 1. Show available CVEs ─────────────────────────────────────────────────────
+
+banner("ARCA — Custom Network Security Tester")
+print("\n  Welcome! This tool trains an RL agent to find attack paths")
+print("  in YOUR network topology and generates remediation advice.\n")
+
+from arca.sim.custom_network import CustomNetworkBuilder, CVE_LIBRARY
+
+print("  Available CVEs you can use in your YAML network definition:")
+print(f"  {'Name':<22} {'CVE':<18} {'Prob':>5}  {'OS'}")
+print(f"  {'-'*65}")
+for name, info in CVE_LIBRARY.items():
+    print(f"  {name:<22} {info['cve']:<18} {info['exploit_prob']:>5.0%}  {', '.join(info['os'])}")
+
+
+# ── 2. Generate template and build network ────────────────────────────────────
+
+banner("STEP 1 / 6  Build Custom Network")
+
+YAML_PATH = "my_home_network.yaml"
+
+# Generate template if it doesn't exist
+if not Path(YAML_PATH).exists():
+    section(f"Generating template → {YAML_PATH}")
+    CustomNetworkBuilder.generate_template(YAML_PATH, preset="home")
+    print(f"\n  📝 Template created at: {YAML_PATH}")
+    print("  Edit it to match your real network, then re-run this script.")
+    print("  For now, continuing with the default template...\n")
+else:
+    section(f"Loading existing network from {YAML_PATH}")
+
+# Build the environment
+env = CustomNetworkBuilder.from_yaml(YAML_PATH)
+obs, info = env.reset()
+
+print(f"\n  Network loaded: {env.spec.name}")
+print(f"  Description:    {env.spec.description}")
+print(f"  Hosts:          {len(env.spec.hosts)}")
+print(f"  Subnets:        {len({h.subnet for h in env.spec.hosts})}")
+print(f"  Connections:    {len(env.spec.connections)} links")
+print(f"  Obs shape:      {obs.shape}")
+print(f"  Attacker entry: {env.spec.attacker_entry}")
+print()
+
+# Show host table
+print("  Host Map:")
+print(f"  {'ID':<4} {'Name':<22} {'IP':<16} {'OS':<14} {'Vulns':<35} {'Critical'}")
+print(f"  {'-'*100}")
+for h in env.spec.hosts:
+    print(f"  [{h.id}]  {h.name:<22} {h.ip:<16} {h.os:<14} "
+          f"{', '.join(h.vulns[:3]):<35} {'⭐' if h.is_critical else ''}")
+
+print()
+print(env.render())
+
+
+# ── 3. Check LLM provider ─────────────────────────────────────────────────────
+
+banner("STEP 2 / 6  LLM Provider Status")
+
+from arca.llm.providers import list_providers, auto_detect_provider
+
+providers = list_providers()
+print()
+for p in providers:
+    status = "✅ available" if p["available"] else "❌ not set up"
+    print(f"  {p['name']:<12} {status:<20} {p['cost']:<15} {p.get('speed','')}")
+
+active = auto_detect_provider()
+print(f"\n  Active provider: [{active.name}]")
+
+if active.name == "rule-based":
+    print("\n  💡 For real LLM analysis, set up one of:")
+    print("     Groq (free):  export GROQ_API_KEY=gsk_...   (console.groq.com)")
+    print("     Ollama:       curl -fsSL https://ollama.com/install.sh | sh")
+    print("                   ollama pull llama3.2:3b && ollama serve")
+
+
+# ── 4. Train PPO agent ────────────────────────────────────────────────────────
+
+banner("STEP 3 / 6  Train RL Agent")
+
+from arca.core.config import ARCAConfig
+from arca.core.agent import ARCAAgent
+
+cfg = ARCAConfig.default()
+cfg.rl.n_steps = 128
+cfg.rl.batch_size = 64
+cfg.rl.total_timesteps = 15_000
+cfg.verbose = 0
+cfg.ensure_dirs()
+
+section(f"Training PPO for {cfg.rl.total_timesteps:,} steps...")
+agent = ARCAAgent(env=env, cfg=cfg)
+agent.train(timesteps=cfg.rl.total_timesteps, progress_bar=True)
+print("  ✓ Training complete!")
+
+
+# ── 5. Run audit episodes ─────────────────────────────────────────────────────
+
+banner("STEP 4 / 6  Run Security Audit (5 Episodes)")
+
+results = []
+for i in range(5):
+    ep = agent.run_episode(render=False)
+    results.append(ep)
+    goal = "✅" if ep.goal_reached else "❌"
+    print(f"  Episode {i+1}: {goal} reward={ep.total_reward:>8.1f}  "
+          f"compromised={ep.hosts_compromised}/{len(env.spec.hosts)}  "
+          f"steps={ep.steps}")
+    if ep.attack_path:
+        print(f"    Path: {' → '.join(ep.attack_path[:5])}{'...' if len(ep.attack_path) > 5 else ''}")
+
+# Summary stats
+avg_reward = sum(r.total_reward for r in results) / len(results)
+avg_comp = sum(r.hosts_compromised for r in results) / len(results)
+success_rate = sum(1 for r in results if r.goal_reached) / len(results)
+
+print(f"\n  Summary: avg_reward={avg_reward:.1f}  "
+      f"avg_compromised={avg_comp:.1f}/{len(env.spec.hosts)}  "
+      f"goal_rate={success_rate*100:.0f}%")
+
+
+# ── 6. Full LLM analysis ──────────────────────────────────────────────────────
+
+banner("STEP 5 / 6  LangGraph Security Analysis")
+
+# Use the best episode for analysis
+best_ep = max(results, key=lambda r: r.hosts_compromised)
+
+# Re-run a fresh episode to get live state
+obs, info = env.reset()
+agent.enable_langgraph()
+
+# Override the provider in the orchestrator
+from arca.agents.langgraph_orchestrator import ARCAOrchestrator
+agent._langgraph = ARCAOrchestrator(cfg=cfg, provider="auto")
+
+section(f"Running analysis via {agent._langgraph.get_provider_name()}...")
+state = env.get_state_dict()
+
+# Enrich state with episode info from best run
+state["episode_info"] = {
+    "total_reward": best_ep.total_reward,
+    "hosts_compromised": best_ep.hosts_compromised,
+    "hosts_discovered": best_ep.hosts_discovered,
+    "attack_path": best_ep.attack_path,
+}
+
+report = agent.reflect(state)
+
+print(f"\n  Severity Score: {report.get('severity_score', 0):.1f} / 10.0")
+
+print("\n  ┌─ ANALYST ────────────────────────────────────────────")
+print(f"  │ {report.get('analyst_output', 'N/A')[:300]}")
+
+print("\n  ┌─ ATTACKER INSIGHTS ──────────────────────────────────")
+print(f"  │ {report.get('attacker_output', 'N/A')[:300]}")
+
+print("\n  ┌─ CRITIC ─────────────────────────────────────────────")
+print(f"  │ {report.get('critic_output', 'N/A')[:300]}")
+
+print("\n  ┌─ REFLECTION ─────────────────────────────────────────")
+print(f"  │ {report.get('reflection', 'N/A')[:300]}")
+
+print("\n  ┌─ ACTION PLAN ────────────────────────────────────────")
+print(f"  │ {report.get('plan', 'N/A')[:400]}")
+
+print("\n  ┌─ REMEDIATION RECOMMENDATIONS ────────────────────────")
+print(f"  │ {report.get('remediation', 'N/A')[:500]}")
+
+
+# ── 7. Visualizations ─────────────────────────────────────────────────────────
+
+banner("STEP 6 / 6  Generate Visualizations")
+
+from arca.viz.visualizer import ARCAVisualizer
+import random
+
+viz = ARCAVisualizer(output_dir="arca_outputs/my_network")
+obs, _ = env.reset()
+
+section("Network topology...")
+try:
+    viz.plot_network(env.get_network_graph(), env.get_hosts(),
+                     title=f"ARCA: {env.spec.name}", save=True, show=False)
+    print("  ✓ arca_outputs/my_network/network_topology.html")
+except Exception as e:
+    print(f"  ✗ {e}")
+
+section("Vulnerability heatmap...")
+try:
+    viz.plot_vuln_heatmap(env.get_hosts(), save=True, show=False)
+    print("  ✓ arca_outputs/my_network/vuln_heatmap.html")
+except Exception as e:
+    print(f"  ✗ {e}")
+
+section("Training performance curves...")
+try:
+    n = len(results)
+    log_data = {
+        "episodes": list(range(n)),
+        "rewards": [r.total_reward for r in results],
+        "compromised": [r.hosts_compromised for r in results],
+        "path_lengths": [len(r.attack_path) for r in results],
+        "success_rates": [1.0 if r.goal_reached else 0.0 for r in results],
+    }
+    viz.plot_training_curves(log_data, save=True, show=False)
+    print("  ✓ arca_outputs/my_network/training_curves.html")
+except Exception as e:
+    print(f"  ✗ {e}")
+
+
+# ── Final summary ──────────────────────────────────────────────────────────────
+
+banner("ARCA AUDIT COMPLETE", char="★")
+
+sev = report.get("severity_score", 0)
+sev_label = "CRITICAL" if sev >= 8 else "HIGH" if sev >= 6 else "MEDIUM" if sev >= 4 else "LOW"
+
+print(f"""
+  Network:        {env.spec.name}
+  Severity:       {sev:.1f}/10.0  [{sev_label}]
+  LLM Provider:   {agent._langgraph.get_provider_name()}
+  Hosts tested:   {len(env.spec.hosts)}
+  Success rate:   {success_rate*100:.0f}% (goal reached in {sum(1 for r in results if r.goal_reached)}/5 episodes)
+  Avg compromised:{avg_comp:.1f}/{len(env.spec.hosts)} hosts per episode
+
+  Visualizations: arca_outputs/my_network/
+
+  Next steps:
+    1. Edit {YAML_PATH} to match your real network topology
+    2. Add more hosts, vulnerabilities, and connections
+    3. Re-run with more training: arca train --network {YAML_PATH} --timesteps 100000
+    4. Enable real LLM: export GROQ_API_KEY=gsk_... (free at console.groq.com)
+    5. Check remediation report above and patch your network!
+""")
+
+
+
 # File: tests/test_arca.py
 # ================================================
 """
@@ -3622,4 +4889,4 @@ class TestIntegration:
 
 # ================================================
 # End of ARCA codebase context
-# Total files included: 21
+# Total files included: 24
