@@ -33,3 +33,17 @@ env/
 .DS_Store
 .vscode/
 .idea/
+# Generated context and test files
+context.txt
+generate_context.sh
+test_comprehensive.py
+test_run.py
+
+# User-specific network definitions
+my_*.yaml
+my_home_network.yaml
+my_office.yaml
+
+# Temporary visual outputs
+arca_test_visuals/
+*.html
