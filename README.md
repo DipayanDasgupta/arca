@@ -1,190 +1,197 @@
 <div align="center">
-  <img src="https://github.com/DipayanDasgupta/arca/raw/main/logo.png" 
-       alt="ARCA Logo" 
-       width="320">
-  
-  <h1>ARCA — Autonomous Reinforcement Cyber Agent</h1>
 
-  > **A fully local, pip-installable RL-powered cyber pentesting simulation framework with LangGraph orchestration and optional C++ acceleration.**
+<img src="https://github.com/DipayanDasgupta/arca/raw/main/logo.png" alt="ARCA Logo" width="320">
 
-  [![PyPI version](https://img.shields.io/pypi/v/arca-agent.svg)](https://pypi.org/project/arca-agent/0.2.3/)
-  [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
-  [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-  [![RL](https://img.shields.io/badge/RL-PPO%20%7C%20A2C%20%7C%20DQN-orange)](https://stable-baselines3.readthedocs.io)
-  [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-purple)](https://langchain-ai.github.io/langgraph)
+# ARCA — Autonomous Reinforcement Cyber Agent
+
+**A fully local, pip-installable RL-powered cyber pentesting simulation framework with Gymnasium environment, Stable-Baselines3 training, optional C++ acceleration, custom network support, and LangGraph-powered red-teaming.**
+
+[![PyPI version](https://img.shields.io/pypi/v/arca-agent.svg)](https://pypi.org/project/arca-agent/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![RL](https://img.shields.io/badge/RL-PPO%20%7C%20A2C%20%7C%20DQN-orange)](https://stable-baselines3.readthedocs.io)
+[![LangGraph](https://img.shields.io/badge/Red--Team-LangGraph-purple)](https://langchain-ai.github.io/langgraph)
+
 </div>
-
-<br>
 
 ---
 
 ## What is ARCA?
 
-ARCA trains a reinforcement learning agent to autonomously discover and exploit vulnerabilities in simulated computer networks. It combines:
+**ARCA** is a local simulation framework that trains reinforcement learning agents to autonomously discover and exploit vulnerabilities in synthetic computer networks.
 
-- **Gymnasium-compatible environment** — realistic hosts, subnets, CVEs, and network topology
-- **PPO/A2C/DQN via Stable-Baselines3** — policy training with eval callbacks and checkpointing
-- **LangGraph multi-agent orchestration** — Analyst → Attacker → Critic → Reflection pipeline with LLM-powered explanations
-- **C++ acceleration via pybind11** — BFS reachability, batch exploit simulation, Floyd-Warshall (with pure-Python fallback)
-- **FastAPI REST interface** — `/train`, `/audit`, `/reflect`, `/visualize` endpoints
-- **Rich visualization suite** — Plotly network graphs, training curves, attack path overlays, vulnerability heatmaps
-- **Full CLI** via Typer: `arca train`, `arca serve`, `arca audit`, `arca viz`
+It provides:
 
-Everything runs **100% locally** — no cloud, no data leaves your machine.
+- A **Gymnasium-compatible** network simulation environment with realistic hosts, subnets, services, and CVEs
+- **Reinforcement Learning** support via Stable-Baselines3 (PPO, A2C, DQN) with training, evaluation, and checkpointing
+- **Custom Network Builder** — define your own network topologies using YAML
+- **Optional C++ acceleration** via pybind11 for performance-critical operations, with a pure-Python fallback
+- **LangGraph-based red-teaming** for LLM prompt injection and jailbreak testing, separate from the RL pentesting simulation
+- **Rich visualization** tools using Plotly and Matplotlib
+- **CLI interface** via Typer
+- **Configuration-driven** design for easy customization
+
+Everything runs **100% locally** — no external cloud services, no data exfiltration.
 
 ---
 
 ## Installation
 
-**Install via PyPI (Recommended)**
+### From PyPI *(Recommended)*
+
 ```bash
 pip install arca-agent
 ```
-*(Note: If your system has a C++ compiler like `g++` or `clang`, pip will automatically compile the high-performance C++ extensions during installation. Otherwise, it will gracefully fall back to the pure-Python implementation.)*
 
-**Install from Source (For Development)**
+> If a C++ compiler (`g++` / `clang`) is available, the high-performance C++ extensions will be compiled automatically. Otherwise, ARCA gracefully falls back to pure Python.
+
+### From Source *(Development)*
+
 ```bash
-git clone https://github.com/dipayandasgupta/arca.git
+git clone https://github.com/DipayanDasgupta/arca.git
 cd arca
 
-# Create virtual environment
 python -m venv venv
-source venv/bin/activate       # Windows: venv\Scripts\activate
+source venv/bin/activate          # Windows: venv\Scripts\activate
 
-# Install in editable mode
-pip install -e .
-
-# Install with explicit C++ dependencies
-pip install -e ".[cpp]"
-
-# Install dev dependencies
-pip install -e ".[dev]"
+pip install -e .                  # Base installation
+pip install -e ".[cpp]"           # With C++ extensions
+pip install -e ".[dev]"           # With dev dependencies
+pip install -e ".[all]"           # All extras
 ```
 
 ---
 
 ## Quickstart
 
+### Python API
+
 ```python
 from arca import ARCAAgent, NetworkEnv, ARCAConfig
 
-# Create environment
+# Load a preset environment
 env = NetworkEnv.from_preset("small_office")
 
-# Create and train agent
+# Create agent and train
 agent = ARCAAgent(env=env)
 agent.train(timesteps=50_000)
 
-# Run one episode
+# Run a trained episode
 result = agent.run_episode(render=True)
 print(result.summary())
 
-# LangGraph reflection
+# Optional: Enable LangGraph reflection / red-teaming
 agent.enable_langgraph()
 report = agent.reflect(env.get_state_dict())
-print(report["reflection"])
+print(report)
 ```
 
-Or via CLI:
+### CLI
 
 ```bash
-arca train --timesteps 50000 --preset small_office
-arca serve                      # starts FastAPI at http://localhost:8000
-arca audit --preset enterprise  # one-shot audit report
-arca viz --output ./figures     # generate all plots
+arca train --timesteps 50000 --preset small_office   # Train on a preset network
+arca audit --preset small_office                     # Run a single episode
+arca viz --output ./figures                          # Generate visualizations
+arca info                                            # Show system and version info
 ```
 
 ---
 
 ## Network Presets
 
-| Preset        | Hosts | Subnets | Vuln Density | Max Steps |
-|---------------|-------|---------|--------------|-----------|
-| `small_office`  | 8     | 2       | 50%          | 150       |
-| `enterprise`    | 25    | 5       | 35%          | 300       |
-| `dmz`           | 15    | 3       | 45%          | 200       |
-| `iot_network`   | 20    | 4       | 60%          | 250       |
+| Preset | Hosts | Subnets | Vuln Density | Max Steps |
+|---|---|---|---|---|
+| `small_office` | 8 | 2 | ~50% | 150 |
+| `enterprise` | 25 | 5 | ~35% | 300 |
+| `dmz` | 15 | 3 | ~45% | 200 |
+| `iot_network` | 20 | 4 | ~60% | 250 |
+
+You can also define fully custom topologies using YAML via `CustomNetworkBuilder`.
 
 ---
 
 ## Actions
 
-| Action      | Description                                          |
-|-------------|------------------------------------------------------|
-| `SCAN`      | Discover a reachable host and its services/vulns     |
-| `EXPLOIT`   | Attempt to compromise a discovered host via a CVE    |
-| `PIVOT`     | Move attacker's position to a compromised host       |
-| `EXFILTRATE`| Extract data value from a compromised host           |
+| Action | Description |
+|---|---|
+| `SCAN` | Discover reachable hosts and their services/vulnerabilities |
+| `EXPLOIT` | Attempt to compromise a discovered host using a CVE |
+| `PIVOT` | Move the attacker's control to a compromised host |
+| `EXFILTRATE` | Extract data value from a compromised host |
 
 ---
 
-## LangGraph Architecture
+## Core Components
 
-```text
-START → analyst_node → attacker_node → critic_node → reflect_node → END
-                              ↑___________________________|
-                                   (reflection loop)
-```
+### 1. Simulation — `arca.sim`
 
-Each node uses a local LLM (via Ollama, default: `llama3`) for natural-language analysis. Falls back to rule-based logic if Ollama is not running.
+- `NetworkEnv` — main Gymnasium environment (presets + custom)
+- `CustomNetworkEnv` — user-defined topologies from YAML
+- `Host`, `Action`, `ActionResult` — core simulation objects
+- `NetworkGenerator` — procedural network creation
+- Rich CVE library with realistic exploit probabilities
 
----
+### 2. Reinforcement Learning — `arca.core`
 
-## C++ Acceleration
+- `ARCAAgent` — high-level interface for training and inference
+- `ARCATrainer` — wraps Stable-Baselines3 with `EvalCallback`, `CheckpointCallback`, and TensorBoard support
+- `ARCAConfig` — centralized dataclass-based configuration (env, rl, llm, viz, api)
 
-The optional `_cpp_sim` module (built via pybind11) provides:
+### 3. LangGraph Red-Teaming — `arca.graph`
 
-- `compute_reachability(adj, n)` — BFS all-pairs reachability (~10x faster than NetworkX for dense graphs)
-- `floyd_warshall(weights, n)` — All-pairs shortest path
-- `batch_exploit(hosts, actions, seed)` — Vectorised exploit simulation
+- Dedicated LangGraph workflow for prompt injection and jailbreak red-teaming against LLMs
+- Nodes: `attacker_node`, `evaluator_node`, `defender_node`, `reporter_node`
+- Supports `EchoTarget`, `OllamaTarget`, OpenAI-compatible targets, and a Retry wrapper
+- Produces structured attack records and mitigation recommendations
 
-Falls back to pure Python automatically if not compiled.
+### 4. C++ Acceleration — `arca.cpp_ext`
 
----
+- Optional `sim_engine.cpp` built with pybind11
+- Functions: `compute_reachability`, `floyd_warshall`, `batch_exploit`
+- Graceful fallback to pure Python if compilation fails
 
-## API Endpoints
+### 5. Visualization — `arca.viz`
 
-Once you run `arca serve`:
+- `ARCAVisualizer` class
+- Network graphs, vulnerability heatmaps, training curves, attack path overlays
 
-| Endpoint              | Method | Description                        |
-|-----------------------|--------|------------------------------------|
-| `/`                   | GET    | Health check + status              |
-| `/train`              | POST   | Start a training run               |
-| `/audit`              | POST   | Run an audit episode + get report  |
-| `/reflect`            | POST   | Run LangGraph reflection on state  |
-| `/status`             | GET    | Current training / agent status    |
-| `/docs`               | GET    | Auto-generated Swagger UI          |
+### 6. CLI — `arca.cli`
+
+- Entry point defined in `pyproject.toml`
+- Commands: `train`, `audit`, `viz`, `info`
 
 ---
 
 ## Project Structure
 
-```text
+```
 arca/
 ├── arca/
-│   ├── __init__.py          # public API
-│   ├── __version__.py
-│   ├── cli.py               # Typer CLI
+│   ├── __init__.py
+│   ├── __version__.py                  # 0.2.6
 │   ├── core/
-│   │   ├── config.py        # ARCAConfig dataclass
-│   │   ├── agent.py         # ARCAAgent (PPO wrapper + LangGraph)
-│   │   └── trainer.py       # SB3 training harness
+│   │   ├── config.py
+│   │   ├── agent.py
+│   │   └── trainer.py
 │   ├── sim/
-│   │   ├── environment.py   # Gymnasium NetworkEnv
-│   │   ├── host.py          # Host dataclass
-│   │   ├── action.py        # Action / ActionResult types
+│   │   ├── environment.py
+│   │   ├── host.py
+│   │   ├── action.py
+│   │   ├── custom_network.py
 │   │   └── network_generator.py
-│   ├── agents/
-│   │   └── langgraph_orchestrator.py
+│   ├── graph/                          # LangGraph red-teaming workflow
+│   │   └── workflow.py
+│   ├── targets/                        # LLM connectors (Echo, Ollama, OpenAI-compatible)
+│   │   └── connectors.py
 │   ├── cpp_ext/
-│   │   ├── __init__.py      # Python fallback + CPP_AVAILABLE flag
-│   │   └── sim_engine.cpp   # pybind11 C++ module
+│   │   ├── __init__.py
+│   │   └── sim_engine.cpp              # Optional C++ backend
 │   ├── viz/
-│   │   └── visualizer.py    # Plotly + NetworkX charts
-│   └── api/
-│       └── server.py        # FastAPI app
+│   │   └── visualizer.py
+│   └── cli/
+│       └── main.py                     # Typer CLI
 ├── tests/
-│   └── test_arca.py
+│   └── test_comprehensive.py
 ├── examples/
 │   └── quickstart.py
 ├── pyproject.toml
@@ -196,11 +203,15 @@ arca/
 
 ## Disclaimer
 
-ARCA is a **simulation and education tool only**. All attack actions run inside a sandboxed in-memory graph. It does **not** perform any real network scanning, exploitation, or traffic generation. For authorised security testing only.
+ARCA is an **educational and research simulation tool only**.
+
+- All attacks and simulations occur in a fully sandboxed, in-memory graph
+- It does not perform real network scanning, exploitation, or generate real network traffic
+- Use only on networks you are authorized to test
 
 ---
 
 ## Author
 
 **Dipayan Dasgupta** — IIT Madras, Civil Engineering  
-[GitHub](https://github.com/dipayandasgupta) · [LinkedIn](https://www.linkedin.com/in/dipayan-dasgupta-24a24719b/)
+[GitHub](https://github.com/DipayanDasgupta) · [LinkedIn](https://linkedin.com/in/dipayandasgupta)
