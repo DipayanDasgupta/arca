@@ -19,13 +19,9 @@ Setup:
   Claude: export ANTHROPIC_API_KEY=sk-ant-...
 """
 
-from __future__ import annotations
-
 import os
-import time
 from abc import ABC, abstractmethod
 from typing import Optional
-from dataclasses import dataclass
 
 
 # ── Base interface ────────────────────────────────────────────────────────────
@@ -97,7 +93,7 @@ class OllamaProvider(LLMProvider):
         return data.get("response", "").strip()
 
 
-# ── Groq (free tier, very fast) ───────────────────────────────────────────────
+# ── Groq (fixed - forces correct model) ───────────────────────────────────────
 
 class GroqProvider(LLMProvider):
     """
@@ -108,12 +104,12 @@ class GroqProvider(LLMProvider):
     Best models for ARCA:
       llama-3.1-8b-instant   — fast, good reasoning
       llama-3.3-70b-versatile — slow but very capable
-      mixtral-8x7b-32768     — good for long context
     """
 
     def __init__(self, model: str = "llama-3.1-8b-instant", api_key: Optional[str] = None):
-        self.model = model
-        self.api_key = api_key or os.environ.get("GROQ_API_KEY", "")
+        # Force correct model - ignore any wrong "llama3" passed from orchestrator
+        self.model = "llama-3.1-8b-instant" if model in ("llama3", "llama-3") else model
+        self.api_key = (api_key or os.environ.get("GROQ_API_KEY", "")).strip()
         self._client = None
 
     @property
@@ -121,7 +117,8 @@ class GroqProvider(LLMProvider):
         return f"groq:{self.model}"
 
     def is_available(self) -> bool:
-        return bool(self.api_key)
+        # Strict check: must start with 'gsk_' and not be empty
+        return bool(self.api_key and self.api_key.startswith("gsk_"))
 
     def _get_client(self):
         if self._client is None:
@@ -130,17 +127,23 @@ class GroqProvider(LLMProvider):
                 self._client = Groq(api_key=self.api_key)
             except ImportError:
                 raise ImportError("Install groq: pip install groq")
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize Groq client: {e}")
         return self._client
 
     def complete(self, prompt: str, max_tokens: int = 512) -> str:
-        client = self._get_client()
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=0.2,
-        )
-        return response.choices[0].message.content.strip()
+        try:
+            client = self._get_client()
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=0.2,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            # Let the caller know it failed so fallback can trigger cleanly
+            raise RuntimeError(f"Groq API call failed: {e}")
 
 
 # ── Anthropic / Claude ────────────────────────────────────────────────────────
@@ -343,7 +346,7 @@ def list_providers() -> list[dict]:
         {
             "name": "groq",
             "model": "llama-3.1-8b-instant",
-            "available": bool(os.environ.get("GROQ_API_KEY")),
+            "available": GroqProvider().is_available(),   # Uses improved check
             "setup": "export GROQ_API_KEY=gsk_... (free at console.groq.com)",
             "cost": "Free tier",
             "speed": "Very fast",
