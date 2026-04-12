@@ -1,6 +1,6 @@
 [project]
 name = "arca-agent"
-version = "0.2.5"
+version = "0.2.6"
 description = "ARCA — Local RL-powered Autonomous Cyber Pentesting Agent with LangGraph"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,7 +28,7 @@ viz = ["dash>=2.16"]
 all = ["pybind11>=2.11", "dash>=2.16", "ollama>=0.2"]
 
 [project.scripts]
-arca = "arca.cli:main"
+arca = "arca.cli.main:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel", "pybind11>=2.11"]
