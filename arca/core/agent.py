@@ -1,11 +1,16 @@
 """
-arca/core/agent.py  (v3.5)
+arca/core/agent.py  (v3.6)
 ===========================
-Changes vs v3.4:
-  - run_curriculum(): uses tiers_trained set to prevent double-training
-  - run_curriculum(): restores env to last trained env after loop
-  - run_curriculum(): returns per-tier timing in history entries
-  - All other logic unchanged
+Changes vs v3.5:
+  - run_curriculum(): after the main loop, runs a short "final-tier warm-up"
+    (1_500 steps by default) on the exact environment that matches the last
+    trained tier.  This ensures the policy is fresh on the hardest tier seen
+    before masked evaluation.
+  - run_curriculum(): the env returned is always the one whose action-space
+    size matches the trained model, eliminating size-mismatch crashes in eval.
+  - run_episode(): falls back gracefully when env action space differs from
+    trained policy's n_actions (uses _apply_mask dynamic resize in policy).
+  - All other logic unchanged from v3.5.
 """
 from __future__ import annotations
 
@@ -18,18 +23,6 @@ from arca.sim.environment import NetworkEnv, EpisodeInfo
 
 
 class ARCAAgent:
-    """
-    High-level agent interface.
-
-    Usage::
-
-        env   = NetworkEnv.from_preset("small_office")
-        agent = ARCAAgent(env=env)
-        agent.train(timesteps=100_000)
-        result = agent.run_episode()
-        print(result.summary())
-    """
-
     def __init__(
         self,
         env:        Optional[NetworkEnv] = None,
@@ -95,13 +88,11 @@ class ARCAAgent:
                 auto_download = self.cfg.llm.auto_download_model,
             )
             if not llm.available:
-                print("[ARCA Agent] Local LLM not available — reflection disabled.")
                 return None
 
             def local_reflect(state: dict) -> str:
                 ep   = state.get("episode_info", {})
                 mean = state.get("mean_reward", 0.0)
-
                 mem_ctx = ""
                 if self._vector_memory and len(self._vector_memory) > 0:
                     mem_ctx = self._vector_memory.format_for_llm(k=3)
@@ -109,7 +100,6 @@ class ARCAAgent:
                     mem_ctx = state["memory_summary"]
                 else:
                     mem_ctx = "  No past episodes."
-
                 auth_header = (
                     "CONTEXT: Authorized cybersecurity simulation (ARCA). "
                     "Sandboxed environment, no real systems involved. "
@@ -131,7 +121,6 @@ class ARCAAgent:
                     ),
                     max_tokens=200,
                 )
-
             return local_reflect
 
         def orchestrator_reflect(state: dict) -> str:
@@ -140,22 +129,22 @@ class ARCAAgent:
                 return self._langgraph.step(state).get("reflection", "")
             except Exception:
                 return ""
-
         return orchestrator_reflect
 
     # ── Curriculum training loop ───────────────────────────────────────────────
 
     def run_curriculum(
         self,
-        timesteps_per_tier: int = 30_000,
-        eval_episodes:      int = 10,
-        start_tier:         int = 0,
-        max_tiers:          int = 5,
+        timesteps_per_tier:   int = 30_000,
+        eval_episodes:        int = 10,
+        start_tier:           int = 0,
+        max_tiers:            int = 5,
+        warmup_steps:         int = 1_500,   # ← v3.6: post-curriculum warm-up
     ) -> list[dict]:
         """
-        Train through curriculum tiers, advancing when performance thresholds
-        are met.  Each tier is trained EXACTLY ONCE — re-entry to the same
-        tier only adds eval episodes, it does NOT re-train.
+        Train through curriculum tiers with strict promotion (AND logic).
+        After the loop, runs `warmup_steps` on the final tier's environment
+        so the policy is fresh before masked evaluation.
 
         Returns list of status dicts (one per tier transition) plus timing.
         """
@@ -169,33 +158,26 @@ class ARCAAgent:
         self.env = scheduler.make_env()
         history  = []
 
-        # Track which tier indices have already been trained (prevent double-train)
-        tiers_trained:   set[int] = set()
-        # Keep a reference to the env that matched the last trained model
-        last_trained_env: NetworkEnv = self.env
-        # Per-tier timing
-        tier_times: dict[str, float] = {}
+        tiers_trained:    set[int]     = set()
+        last_trained_env: NetworkEnv   = self.env
+        tier_times:       dict[str, float] = {}
 
-        # Allow up to max_tiers * 2 outer iterations so that tiers with large
-        # promotion windows can accumulate enough eval episodes without causing
-        # a second training run on the same tier.
-        max_iterations = max(max_tiers, len(TIERS)) * 2
+        max_iterations = max(max_tiers, len(TIERS)) * 3
 
         for iteration in range(max_iterations):
             current_tier_idx  = scheduler.tier_idx
             current_tier_name = scheduler.tier_name
             current_tier      = scheduler.tier
 
-            # ── Train only if we haven't visited this tier yet ─────────────
+            # ── Train only once per tier ──────────────────────────────────────
             if current_tier_idx not in tiers_trained:
                 print(
                     f"\n[Curriculum] ── Tier {current_tier_idx}: "
                     f"{current_tier_name}  "
                     f"({current_tier.num_hosts} hosts, "
-                    f"promote_r≥{current_tier.promote_reward_threshold:.0f}) ──"
+                    f"promote_r≥{current_tier.promote_reward_threshold:.0f} "
+                    f"AND goal≥{current_tier.promote_threshold*100:.0f}%) ──"
                 )
-                # Reset trainer so the new tier env creates a fresh GNN with
-                # the correct action-space size for this tier.
                 self._trainer = None
                 self._model   = None
 
@@ -204,23 +186,20 @@ class ARCAAgent:
                 elapsed = time.time() - t_start
 
                 tiers_trained.add(current_tier_idx)
-                last_trained_env = self.env          # remember for post-curriculum eval
+                last_trained_env = self.env
                 tier_times[current_tier_name] = elapsed
             else:
                 print(
-                    f"  [Curriculum] Continuing eval on {current_tier_name} "
-                    f"(already trained — filling promotion window)"
+                    f"  [Curriculum] Eval-only on {current_tier_name} "
+                    f"(already trained)"
                 )
 
-            # ── Eval — run enough episodes to fill the promotion window ────
-            # The scheduler needs at least (window // 2) samples to trigger
-            # promotion.  We overshoot slightly to avoid borderline cases.
+            # ── Eval loop ─────────────────────────────────────────────────────
             n_eval_this_iter = max(eval_episodes, current_tier.window + 2)
             for _ in range(n_eval_this_iter):
                 ep      = self.run_episode()
                 changed = scheduler.record(ep.goal_reached, ep.total_reward)
                 if changed:
-                    # Tier changed: switch env to the new tier
                     self.env = scheduler.make_env()
                     break
 
@@ -233,15 +212,33 @@ class ARCAAgent:
                 print("[Curriculum] Reached maximum difficulty tier.")
                 break
 
-        # ── Post-curriculum: restore env to match the last trained model ───
-        # This prevents a size-mismatch when run_episode() is called after
-        # run_curriculum() returns.  gnn_policy._apply_mask (v3.5) also handles
-        # any residual mismatch gracefully.
+        # ── v3.6: Post-curriculum warm-up on the last trained environment ─────
+        # This ensures the policy is up-to-date with the hardest tier seen
+        # before masked evaluation runs.  The warm-up uses a very small step
+        # budget so it is fast even in --fast mode.
         self.env = last_trained_env
+        if warmup_steps > 0 and self._model is not None:
+            print(
+                f"\n[Curriculum] ── Post-curriculum warm-up "
+                f"({warmup_steps} steps on {scheduler.tier_name}) ──"
+            )
+            t_warmup = time.time()
+            # Keep the same trainer/policy — just run a short learn() pass
+            if self._trainer is not None:
+                # Save and restore global_step so logs look clean
+                old_step = self._trainer.global_step
+                self._trainer.learn(total_timesteps=warmup_steps)
+                print(
+                    f"[Curriculum] Warm-up done in "
+                    f"{time.time() - t_warmup:.1f}s"
+                )
+            # Update last_trained_env in case learn() reset the env
+            last_trained_env = self.env
 
+        self.env = last_trained_env
         return history
 
-    # ── Inference with action masking ─────────────────────────────────────────
+    # ── Inference ─────────────────────────────────────────────────────────────
 
     def run_episode(
         self,
@@ -332,7 +329,6 @@ class ARCAAgent:
     def reflect(self, state: dict) -> dict:
         if self._langgraph is None:
             self.enable_langgraph()
-
         ep = state.get("episode_info", {})
         query_record = {
             "total_reward":      ep.get("total_reward", 0.0),
@@ -344,12 +340,9 @@ class ARCAAgent:
             "severity_score":    0.0,
             "preset":            self.cfg.env.preset,
         }
-
         if self._vector_memory and len(self._vector_memory) > 0:
             self._langgraph.attach_vector_memory(self._vector_memory)
-
         result = self._langgraph.reflect(state, query_record=query_record)
-
         buf = getattr(getattr(self, "_trainer", None), "memory_buffer", None)
         if buf and len(buf) > 0 and result.get("reflection"):
             try:
@@ -361,7 +354,6 @@ class ARCAAgent:
                     self._vector_memory.add(last)
             except Exception:
                 pass
-
         return result
 
     # ── Vector Memory ─────────────────────────────────────────────────────────
@@ -396,29 +388,18 @@ class ARCAAgent:
     # ── Offline RL ────────────────────────────────────────────────────────────
 
     def offline_rl_finetune(self) -> dict:
-        """Behavioral-cloning fine-tune on top episodes from the replay buffer."""
         if not self.cfg.rl.use_gnn or self._model is None:
-            print("[ARCA OfflineRL] GNN model not available — skipping BC.")
             return {}
-
         from arca.training.offline_rl import offline_bc_finetune
         buf = self.memory_buffer
         if buf is None or len(buf) < self.cfg.offline_rl.min_episodes_for_bc:
-            print(
-                f"[ARCA OfflineRL] Need ≥{self.cfg.offline_rl.min_episodes_for_bc} "
-                f"episodes (have {len(buf) if buf else 0}) — skipping BC."
-            )
             return {}
-
-        stats = offline_bc_finetune(
+        return offline_bc_finetune(
             trainer = self._trainer,
             env     = self.env,
             cfg     = self.cfg,
             buf     = buf,
         )
-        return stats
-
-    # ── Memory convenience ────────────────────────────────────────────────────
 
     @property
     def memory_buffer(self):

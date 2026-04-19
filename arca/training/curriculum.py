@@ -1,15 +1,18 @@
 """
-arca/training/curriculum.py  (v3.3)
+arca/training/curriculum.py  (v3.6)
 =====================================
-Key fixes vs v3.2:
-  1. DifficultyTier gains promote_reward_threshold — promotion fires if
-     EITHER goal_rate OR mean_reward exceeds the threshold (OR logic).
-     This unblocks the agent when it has good rewards but 0% goal rate.
-  2. Micro tier window reduced from 15 → 8 so promotion evaluates sooner.
-  3. promote_reward_threshold set to ~800 for micro (well below the
-     1100–1979 rewards we actually see in training logs).
-  4. record() prints a concise progress line every 5 episodes.
-  5. _apply_tier() also sets cfg.rl.ent_coef per tier (harder → less entropy).
+Key fix vs v3.5:
+  Promotion now requires BOTH conditions (AND logic, not OR):
+    1. goal_rate  >= tier.promote_threshold  (≥ 30% by default)
+    2. mean_reward >= tier.promote_reward_threshold  (positive reward)
+
+  Previously OR logic meant the agent promoted on high raw reward even
+  with 0% goal rate — leading to a policy that never actually completes
+  the objective advancing into harder tiers, causing negative eval rewards.
+
+  Demotion logic unchanged (OR — either bad metric triggers demotion).
+  promote_threshold raised to 0.30 across all tiers so 0% goal rate
+  is never sufficient for promotion.
 """
 from __future__ import annotations
 
@@ -31,15 +34,15 @@ class DifficultyTier:
     reward_exploit:          float = 20.0
     reward_discovery:        float = 5.0
     reward_step:             float = -0.5
-    # ── Promotion criteria (OR logic: either condition triggers advance) ──────
-    promote_threshold:       float = 0.60   # goal-rate fraction
-    promote_reward_threshold: float = 800.0  # mean reward over window
+    # ── Promotion criteria (AND logic: BOTH conditions must be true) ──────────
+    promote_threshold:       float = 0.30   # goal-rate fraction (≥ 30%)
+    promote_reward_threshold: float = 200.0  # mean reward must be positive
     # ── Demotion ──────────────────────────────────────────────────────────────
-    demote_threshold:        float = 0.15
-    demote_reward_threshold: float = 50.0   # demote if mean reward is this low
-    # ── Rolling window size ───────────────────────────────────────────────────
+    demote_threshold:        float = 0.05
+    demote_reward_threshold: float = 30.0
+    # ── Rolling window ────────────────────────────────────────────────────────
     window:                  int   = 20
-    # ── Entropy coefficient override (None = keep cfg default) ───────────────
+    # ── Entropy coefficient override ─────────────────────────────────────────
     ent_coef:                Optional[float] = None
 
 
@@ -49,11 +52,11 @@ TIERS: list[DifficultyTier] = [
         num_hosts=4, num_subnets=2,
         vulnerability_density=0.9, max_steps=80,
         firewall_subnets=0,
-        promote_threshold=0.60,
-        promote_reward_threshold=700.0,   # micro runs often hit 1000–2100
+        promote_threshold=0.30,          # ← was 0.60 (OR), now 0.30 (AND)
+        promote_reward_threshold=300.0,
         demote_threshold=0.0,
         demote_reward_threshold=0.0,
-        window=8,                          # small window → faster evaluation
+        window=10,
         ent_coef=0.07,
     ),
     DifficultyTier(
@@ -61,10 +64,10 @@ TIERS: list[DifficultyTier] = [
         num_hosts=8, num_subnets=2,
         vulnerability_density=0.5, max_steps=150,
         firewall_subnets=0,
-        promote_threshold=0.55,
-        promote_reward_threshold=600.0,
-        demote_threshold=0.10,
-        demote_reward_threshold=80.0,
+        promote_threshold=0.30,
+        promote_reward_threshold=250.0,
+        demote_threshold=0.05,
+        demote_reward_threshold=50.0,
         window=15,
         ent_coef=0.05,
     ),
@@ -73,10 +76,10 @@ TIERS: list[DifficultyTier] = [
         num_hosts=12, num_subnets=3,
         vulnerability_density=0.45, max_steps=200,
         firewall_subnets=1,
-        promote_threshold=0.50,
-        promote_reward_threshold=500.0,
-        demote_threshold=0.10,
-        demote_reward_threshold=60.0,
+        promote_threshold=0.30,
+        promote_reward_threshold=200.0,
+        demote_threshold=0.05,
+        demote_reward_threshold=40.0,
         window=20,
         ent_coef=0.04,
     ),
@@ -85,10 +88,10 @@ TIERS: list[DifficultyTier] = [
         num_hosts=18, num_subnets=4,
         vulnerability_density=0.35, max_steps=280,
         firewall_subnets=2,
-        promote_threshold=0.45,
-        promote_reward_threshold=400.0,
-        demote_threshold=0.08,
-        demote_reward_threshold=50.0,
+        promote_threshold=0.30,
+        promote_reward_threshold=150.0,
+        demote_threshold=0.05,
+        demote_reward_threshold=30.0,
         window=25,
         ent_coef=0.03,
     ),
@@ -99,8 +102,8 @@ TIERS: list[DifficultyTier] = [
         firewall_subnets=3,
         promote_threshold=1.01,          # never auto-promotes from hardest
         promote_reward_threshold=9999.0,
-        demote_threshold=0.05,
-        demote_reward_threshold=40.0,
+        demote_threshold=0.03,
+        demote_reward_threshold=20.0,
         window=30,
         ent_coef=0.02,
     ),
@@ -111,20 +114,20 @@ class CurriculumScheduler:
     """
     Tracks agent performance and advances/retreats through difficulty tiers.
 
-    Promotion logic (OR):
-      - goal_rate  >= tier.promote_threshold
+    Promotion logic (AND — BOTH must be true):
+      - goal_rate   >= tier.promote_threshold      (≥ 30%)
       - mean_reward >= tier.promote_reward_threshold
 
-    Demotion logic (OR):
-      - goal_rate  <= tier.demote_threshold  (and tier > 0)
-      - mean_reward <= tier.demote_reward_threshold  (and tier > 0)
+    Demotion logic (OR — either triggers retreat):
+      - goal_rate  <= tier.demote_threshold
+      - mean_reward <= tier.demote_reward_threshold
     """
 
     def __init__(
         self,
-        start_tier: int              = 0,
+        start_tier: int               = 0,
         cfg:        Optional[ARCAConfig] = None,
-        verbose:    bool             = True,
+        verbose:    bool              = True,
     ):
         self.tier_idx   = max(0, min(start_tier, len(TIERS) - 1))
         self.cfg        = cfg or ARCAConfig()
@@ -136,9 +139,7 @@ class CurriculumScheduler:
         self._promotions: int          = 0
         self._demotions:  int          = 0
 
-        # History of (tier_name, ep_count, goal_rate, mean_reward) for report
         self.tier_history: list[dict]  = []
-
         self._apply_tier()
 
     # ── Properties ────────────────────────────────────────────────────────────
@@ -171,12 +172,10 @@ class CurriculumScheduler:
         self._history.append(goal_reached)
         self._rewards.append(total_reward)
 
-        # Keep window
         while len(self._history) > t.window:
             self._history.popleft()
             self._rewards.popleft()
 
-        # Need at least half the window before evaluating
         min_samples = max(4, t.window // 2)
         if len(self._history) < min_samples:
             return False
@@ -184,19 +183,18 @@ class CurriculumScheduler:
         goal_rate   = sum(self._history) / len(self._history)
         mean_reward = sum(self._rewards)  / len(self._rewards)
 
-        # Verbose progress every 5 episodes
         if self.verbose and self._ep_count % 5 == 0:
             print(
                 f"  [Curriculum/{t.name}] ep={self._ep_count}  "
                 f"goal_rate={goal_rate*100:.0f}%  "
                 f"mean_reward={mean_reward:.0f}  "
-                f"(promote_r≥{t.promote_reward_threshold:.0f}  "
-                f"promote_g≥{t.promote_threshold*100:.0f}%)"
+                f"(need goal≥{t.promote_threshold*100:.0f}%  "
+                f"AND reward≥{t.promote_reward_threshold:.0f})"
             )
 
-        # ── Promotion (OR logic) ───────────────────────────────────────────────
+        # ── Promotion: BOTH conditions required ───────────────────────────────
         if not self.is_at_max and (
-            goal_rate   >= t.promote_threshold or
+            goal_rate   >= t.promote_threshold and
             mean_reward >= t.promote_reward_threshold
         ):
             self.tier_history.append(self._snapshot(goal_rate, mean_reward))
@@ -205,20 +203,15 @@ class CurriculumScheduler:
             self._clear_window()
             self._apply_tier()
             if self.verbose:
-                reason = (
-                    f"goal_rate={goal_rate*100:.0f}%"
-                    if goal_rate >= t.promote_threshold
-                    else f"mean_reward={mean_reward:.0f}"
-                )
                 print(
                     f"\n[Curriculum] ↑ PROMOTED → [{self.tier.name}]  "
-                    f"(reason: {reason})\n"
+                    f"(goal={goal_rate*100:.0f}%  reward={mean_reward:.0f})\n"
                 )
             return True
 
-        # ── Demotion (OR logic, never below tier 0) ────────────────────────────
+        # ── Demotion: OR logic, never below tier 0 ────────────────────────────
         if not self.is_at_min and (
-            (goal_rate   <= t.demote_threshold  and t.demote_threshold  > 0) or
+            (goal_rate   <= t.demote_threshold      and t.demote_threshold      > 0) or
             (mean_reward <= t.demote_reward_threshold and t.demote_reward_threshold > 0)
         ):
             self.tier_history.append(self._snapshot(goal_rate, mean_reward))
@@ -229,15 +222,13 @@ class CurriculumScheduler:
             if self.verbose:
                 print(
                     f"\n[Curriculum] ↓ DEMOTED → [{self.tier.name}]  "
-                    f"(goal_rate={goal_rate*100:.0f}%  "
-                    f"mean_reward={mean_reward:.0f})\n"
+                    f"(goal={goal_rate*100:.0f}%  reward={mean_reward:.0f})\n"
                 )
             return True
 
         return False
 
     def make_env(self):
-        """Build a fresh NetworkEnv for the current tier."""
         from arca.sim.environment import NetworkEnv
         return NetworkEnv(cfg=self.cfg)
 
@@ -277,7 +268,6 @@ class CurriculumScheduler:
         self.cfg.env.reward_exploit        = t.reward_exploit
         self.cfg.env.reward_discovery      = t.reward_discovery
         self.cfg.env.reward_step           = t.reward_step
-        # Per-tier entropy coefficient
         if t.ent_coef is not None:
             self.cfg.rl.ent_coef = t.ent_coef
 
