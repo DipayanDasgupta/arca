@@ -1,10 +1,13 @@
 # -----------------------------
-# ARCA Specific
+# ARCA Specific Outputs
 # -----------------------------
 arca_outputs/
+arca_test_visuals/
+*.html
+*.zip
 
 # -----------------------------
-# Compiled Python / C++
+# Compiled Files (C++ & Python)
 # -----------------------------
 __pycache__/
 *.py[cod]
@@ -12,53 +15,51 @@ __pycache__/
 *.so
 *.o
 build/
-
-# -----------------------------
-# Packaging / Distribution
-# -----------------------------
-dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
 *.egg-info/
+.installed.cfg
 *.egg
 
 # -----------------------------
-# Environments
+# Packaging & Distribution
+# -----------------------------
+dist/
+
+# -----------------------------
+# Environments & IDEs
 # -----------------------------
 venv/
 .venv/
 env/
-
-# -----------------------------
-# OS / IDE
-# -----------------------------
+.env
 .DS_Store
 .vscode/
 .idea/
-# Generated context and test files
+
+# -----------------------------
+# Local Development / Secrets
+# -----------------------------
+# Never commit the demo folder or files with API keys/secrets
+demo/
 context.txt
 generate_context.sh
 test_comprehensive.py
 test_run.py
+test_llm*.py
 
 # User-specific network definitions
 my_*.yaml
 my_home_network.yaml
 my_office.yaml
 
-# Temporary visual outputs
-arca_test_visuals/
-*.html
-# Generated and temporary files - do not track
-context.txt
-generate_context.sh
-test_comprehensive.py
-test_run.py
-my_*.yaml
-my_home_network.yaml
-my_office.yaml
-arca_test_visuals/
-*.html
-
-# Never commit demo folder or any files with secrets
-demo/
-*.zip
-test_llm*.py
+# Documentation artifacts
+docs/_build/

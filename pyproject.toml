@@ -1,10 +1,10 @@
 [project]
 name = "arca-agent"
-version = "0.3.0"
+version = "0.3.0"                                      # ← Changed
 description = "ARCA — Recursive GNN+RL Autonomous Cyber Agent with Local LLM reflection"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = {text = "MIT"}                               # ← Fixed (was table)
 authors = [{name = "Dipayan Dasgupta", email = "deep.dasgupta2006@gmail.com"}]
 keywords = [
     "reinforcement-learning", "cybersecurity", "pentesting",
@@ -12,28 +12,20 @@ keywords = [
     "autonomous-agent", "local-llm"
 ]
 
+# Add this line to silence the classifiers warning
+dynamic = ["classifiers"]
+
 # ── Core dependencies (CPU-safe, always installed) ───────────────────────────
 dependencies = [
-    # Numerics + RL env
     "numpy>=1.26",
     "gymnasium>=1.0",
     "networkx>=3.3",
-
-    # PyTorch (CPU wheel by default; GPU via extras)
     "torch>=2.3.0",
-
-    # PyTorch Geometric (graph neural networks)
     "torch-geometric>=2.5.0",
-
-    # Local LLM (optional at runtime, listed here so pip resolves it)
     "llama-cpp-python>=0.3.0",
-
-    # LangGraph orchestration
     "langgraph>=0.2",
     "langchain-core>=0.3",
     "langchain>=0.3",
-
-    # API + CLI + viz
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "pydantic>=2.0",
@@ -43,11 +35,7 @@ dependencies = [
     "plotly>=5.20",
     "pandas>=2.0",
     "pyyaml>=6.0",
-
-    # TensorBoard
     "tensorboard>=2.17",
-
-    # HTTP (for connectors)
     "httpx>=0.27",
     "ollama>=0.2",
 ]
@@ -57,23 +45,10 @@ Homepage   = "https://github.com/DipayanDasgupta/arca"
 Repository = "https://github.com/DipayanDasgupta/arca"
 
 [project.optional-dependencies]
-# GPU training: install CUDA-enabled torch + PyG separately (see INSTALL.md)
-gpu = [
-    "stable-baselines3>=2.3",   # kept for legacy mode
-]
-
-# Stable-Baselines3 (legacy / use_gnn=False mode)
-sb3 = [
-    "stable-baselines3>=2.3",
-]
-
-# C++ acceleration
+gpu = ["stable-baselines3>=2.3"]
+sb3 = ["stable-baselines3>=2.3"]
 cpp = ["pybind11>=2.11"]
-
-# Dev + test
 dev = ["pytest", "pytest-cov", "black", "ruff", "mypy"]
-
-# Everything
 all = [
     "stable-baselines3>=2.3",
     "pybind11>=2.11",
@@ -94,6 +69,7 @@ include = ["arca*"]
 exclude = ["tests*", "examples*"]
 
 [tool.setuptools.package-data]
+"arca" = ["*.cpp", "cpp_ext/*.cpp"]
 "arca.cpp_ext" = ["*.cpp"]
 
 [tool.setuptools]

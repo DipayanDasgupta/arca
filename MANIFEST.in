@@ -2,9 +2,13 @@ include README.md
 include pyproject.toml
 include setup.py
 include MANIFEST.in
-recursive-include arca *.py *.cpp *.so
+
+recursive-include arca *.py *.cpp
 recursive-include tests *.py
-global-exclude *.pyc *.pyo __pycache__/* *.log
+
+global-exclude *.pyc *.pyo __pycache__/* *.log *.so
 prune arca_outputs
 prune arca_test_visuals
 prune docs
+prune build
+prune dist
