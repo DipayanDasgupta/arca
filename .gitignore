@@ -1,21 +1,16 @@
-# -----------------------------
-# ARCA Specific Outputs
-# -----------------------------
-arca_outputs/
-arca_test_visuals/
-*.html
-*.zip
-
-# -----------------------------
-# Compiled Files (C++ & Python)
-# -----------------------------
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# C extensions
 *.so
-*.o
+
+# Distribution / packaging
+.Python
 build/
 develop-eggs/
+dist/
 downloads/
 eggs/
 .eggs/
@@ -25,41 +20,40 @@ parts/
 sdist/
 var/
 wheels/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
-# -----------------------------
-# Packaging & Distribution
-# -----------------------------
-dist/
-
-# -----------------------------
-# Environments & IDEs
-# -----------------------------
-venv/
+# Virtual environments
 .venv/
+venv/
+ENV/
 env/
-.env
-.DS_Store
+
+# ARCA specific
+arca_outputs/
+arca_test_visuals/
+*.so
+vector_cache.pkl
+episode_buffer.json
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Editor / IDE files
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# -----------------------------
-# Local Development / Secrets
-# -----------------------------
-# Never commit the demo folder or files with API keys/secrets
-demo/
-context.txt
-generate_context.sh
-test_comprehensive.py
-test_run.py
-test_llm*.py
-
-# User-specific network definitions
-my_*.yaml
-my_home_network.yaml
-my_office.yaml
-
-# Documentation artifacts
-docs/_build/
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

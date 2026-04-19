@@ -1,9 +1,11 @@
 """
-arca/core/config.py  (v3.1)
+arca/core/config.py  (v3.3)
 ============================
-Central configuration for ARCA.
-Key change v3.1: ent_coef raised to 0.05 (was 0.01) to prevent the GNN
-policy collapsing to a single action and getting stuck at -75 reward.
+Changes vs v3.2:
+  - LLMConfig: ethical_mode (bool) — controls prompt framing, not safety
+  - OfflineRLConfig: replay-buffer fine-tuning settings
+  - ReportConfig: automated markdown report settings
+  - CurriculumConfig: promote_reward_threshold added (reward-based promotion)
 """
 from __future__ import annotations
 
@@ -41,7 +43,6 @@ class RLConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    # v3.1 FIX: raised from 0.01 → 0.05 to prevent GNN policy collapse
     ent_coef: float = 0.05
     total_timesteps: int = 100_000
     eval_freq: int = 10_000
@@ -49,13 +50,13 @@ class RLConfig:
     device: str = "auto"
     tensorboard_log: Optional[str] = "arca_outputs/tensorboard"
 
-    # ── v3: GNN settings ──────────────────────────────────────────────────────
+    # GNN settings
     use_gnn: bool = True
     gnn_hidden_dim: int = 128
-    use_gat: bool = False   # GATv2 instead of GCN (slower but more expressive)
+    use_gat: bool = False
 
-    # ── v3: Online reflection ─────────────────────────────────────────────────
-    online_reflection_interval: int = 5_000   # LLM critique every N global steps
+    # Online reflection
+    online_reflection_interval: int = 5_000
 
 
 @dataclass
@@ -64,10 +65,10 @@ class LLMConfig:
     use_local_llm: bool = True
     local_model_key: str = "llama-3.2-3b"
     local_model_dir: str = str(Path.home() / ".arca" / "models")
-    local_n_gpu_layers: int = -1   # -1 = all on GPU; 0 = CPU
+    local_n_gpu_layers: int = -1
     auto_download_model: bool = False
 
-    # Legacy remote provider (fallback when use_local_llm=False or model missing)
+    # Remote provider fallback
     provider: Literal["ollama", "openai", "anthropic", "groq"] = "ollama"
     model: str = "llama3"
     base_url: str = "http://localhost:11434"
@@ -76,21 +77,56 @@ class LLMConfig:
     reflection_interval: int = 10
     critic_enabled: bool = True
     reflection_enabled: bool = True
-
-    # v3: enabled flag (set False to skip all LLM calls)
     enabled: bool = True
+
+    # v3.3: Ethical mode — when True, prompts are framed as "authorized
+    # security simulation" but never refuse. When False, prompts are more
+    # direct for advanced red-team research contexts.
+    # NOTE: This does NOT enable any real-world attack capability — ARCA
+    # is always a sandboxed simulation.
+    ethical_mode: bool = True
 
 
 @dataclass
 class MemoryConfig:
-    """Persistent episodic memory settings (v3.1)."""
+    """Persistent episodic memory settings."""
     enabled: bool = True
     memory_dir: str = str(Path.home() / ".arca" / "memory")
     max_episodes: int = 1000
-    # Min hosts compromised before an episode is worth recording
     min_compromised_to_record: int = 1
-    # Seed reward mods from past memory at training start
     seed_reward_mods_from_memory: bool = True
+
+
+@dataclass
+class OfflineRLConfig:
+    """v3.3: Offline RL / behavioral cloning from replay buffer."""
+    enabled: bool = True
+    # Fraction of top episodes to keep in replay buffer
+    top_episode_fraction: float = 0.20
+    # Fine-tune every N training steps (0 = only at end of training)
+    finetune_every_n_steps: int = 0
+    # BC learning rate (usually lower than online LR)
+    bc_learning_rate: float = 1e-4
+    # BC epochs per fine-tune call
+    bc_epochs: int = 3
+    # BC batch size
+    bc_batch_size: int = 32
+    # Minimum episodes before BC is triggered
+    min_episodes_for_bc: int = 50
+    # Path to save the replay buffer
+    replay_buffer_path: str = str(Path.home() / ".arca" / "memory" / "replay_buffer.pkl")
+
+
+@dataclass
+class ReportConfig:
+    """v3.3: Automated markdown report generation."""
+    enabled: bool = True
+    output_dir: str = "arca_outputs/reports"
+    include_attack_paths: bool = True
+    include_reward_curves: bool = True
+    include_llm_lessons: bool = True
+    max_attack_paths_shown: int = 10
+    max_lessons_shown: int = 5
 
 
 @dataclass
@@ -116,37 +152,42 @@ class VizConfig:
 
 @dataclass
 class ARCAConfig:
-    """Master configuration for ARCA."""
-    env:       EnvConfig    = field(default_factory=EnvConfig)
-    rl:        RLConfig     = field(default_factory=RLConfig)
-    llm:       LLMConfig    = field(default_factory=LLMConfig)
-    memory:    MemoryConfig = field(default_factory=MemoryConfig)
-    api:       APIConfig    = field(default_factory=APIConfig)
-    viz:       VizConfig    = field(default_factory=VizConfig)
-    model_dir: str = "arca_outputs/models"
-    log_dir:   str = "arca_outputs/logs"
-    seed:      int = 42
-    verbose:   int = 1
+    """Master configuration for ARCA v3.3."""
+    env:        EnvConfig     = field(default_factory=EnvConfig)
+    rl:         RLConfig      = field(default_factory=RLConfig)
+    llm:        LLMConfig     = field(default_factory=LLMConfig)
+    memory:     MemoryConfig  = field(default_factory=MemoryConfig)
+    offline_rl: OfflineRLConfig = field(default_factory=OfflineRLConfig)
+    report:     ReportConfig  = field(default_factory=ReportConfig)
+    api:        APIConfig     = field(default_factory=APIConfig)
+    viz:        VizConfig     = field(default_factory=VizConfig)
+    model_dir:  str           = "arca_outputs/models"
+    log_dir:    str           = "arca_outputs/logs"
+    seed:       int           = 42
+    verbose:    int           = 1
 
     @classmethod
     def default(cls) -> "ARCAConfig":
         return cls()
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "ARCAConfig":
+    def from_yaml(cls, path) -> "ARCAConfig":
         with open(path) as f:
             data = yaml.safe_load(f)
         cfg = cls()
         _apply_dict(cfg, data or {})
         return cfg
 
-    def to_yaml(self, path: str | Path) -> None:
+    def to_yaml(self, path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             yaml.dump(_to_dict(self), f, default_flow_style=False)
 
     def ensure_dirs(self) -> None:
-        for d in [self.model_dir, self.log_dir, self.viz.output_dir]:
+        for d in [
+            self.model_dir, self.log_dir, self.viz.output_dir,
+            self.report.output_dir, self.memory.memory_dir,
+        ]:
             Path(d).mkdir(parents=True, exist_ok=True)
         if self.rl.tensorboard_log:
             Path(self.rl.tensorboard_log).mkdir(parents=True, exist_ok=True)
