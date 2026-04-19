@@ -1,105 +1,252 @@
 """
-arca.agents.langgraph_orchestrator
-===================================
-Improved LangGraph multi-agent system with:
-  - Proper multi-provider LLM (Ollama / Groq / Anthropic / OpenAI / rule-based)
-  - Rich, context-aware prompts using full host details
-  - 5-node graph: Analyst → Attacker → Critic → Reflector → Planner
-  - Remediation node: generates defender's patch recommendations
-  - Persistent memory across episodes
-  - Structured output with severity scoring
-"""
+arca/agents/langgraph_orchestrator.py  (v3.1 — FIXED)
+=======================================================
+Critical fix: self._llm was both an instance attribute (LocalLLM object)
+AND a method name, causing `TypeError: 'LocalLLM' object is not callable`.
 
+Renamed:
+  self._local_llm_instance  — stores the LocalLLM object
+  self._llm_call            — stores the bound callable (function pointer)
+  self._call_llm()          — the internal dispatch helper method
+
+Improvements:
+  - Integrates EpisodeBuffer for persistent memory across runs
+  - LLM prompts enriched with past episode statistics
+  - LocalLLM → Ollama → Groq → rule-based priority chain
+  - get_provider_name() returns a clean string
+"""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, TypedDict, Optional
 
 from arca.core.config import ARCAConfig
 
 
-# ── Graph state ───────────────────────────────────────────────────────────────
-
 class ARCAGraphState(TypedDict):
-    network_state: dict
-    analyst_output: str
-    attacker_output: str
-    critic_output: str
-    reflection: str
-    plan: str
-    remediation: str
-    severity_score: float       # 0.0–10.0 CVSS-like overall risk
-    episode_history: list[dict]
+    network_state:    dict
+    analyst_output:   str
+    attacker_output:  str
+    critic_output:    str
+    reflection:       str
+    plan:             str
+    remediation:      str
+    severity_score:   float       # 0.0–10.0
+    episode_history:  list[dict]
 
-
-# ── Orchestrator ──────────────────────────────────────────────────────────────
 
 class ARCAOrchestrator:
     """
-    LangGraph multi-agent orchestrator.
+    LangGraph multi-agent orchestrator (v3.1).
 
-    Nodes:
-      analyst    — describes current network state in plain English
-      attacker   — suggests optimal next exploit moves
-      critic     — evaluates agent efficiency, finds weaknesses
-      reflector  — extracts lessons for future episodes
-      planner    — generates structured action plan
-      remediator — provides defender patch recommendations (bonus node)
-
-    LLM providers auto-detected in order:
-      Ollama → Groq → Anthropic → OpenAI → Rule-based fallback
+    LLM provider priority (local-first):
+      1. LocalLLM  (llama-cpp-python, fully local, GPU offload)
+      2. Ollama    (local server)
+      3. Groq      (free API key)
+      4. Rule-based fallback (always works, zero dependencies)
     """
 
     def __init__(
         self,
         cfg: Optional[ARCAConfig] = None,
-        provider: Optional[str] = None,    # "auto" | "ollama" | "groq" | "anthropic" | "openai" | "rule"
+        provider: Optional[str] = None,
         model: Optional[str] = None,
     ):
         self.cfg = cfg or ARCAConfig()
         self._memory: list[dict] = []
         self._graph = None
 
-        # Init LLM provider
-        from arca.llm.providers import auto_detect_provider
-        self._provider = auto_detect_provider(
-            preferred=provider or self.cfg.llm.provider or "auto",
-            model=model or self.cfg.llm.model or None,
-        )
-        self._llm_available = not self._provider.name.startswith("rule")
-        print(f"[ARCA] LLM provider: {self._provider.name} "
-              f"({'✓ connected' if self._llm_available else '⚠ rule-based fallback'})")
+        # These are the correctly-named attributes (no name collision with methods)
+        self._local_llm_instance = None   # LocalLLM object, if loaded
+        self._llm_call = None             # Callable: (system, user) -> str
+        self._provider_name = "rule-based"
 
+        self._resolve_llm_provider(provider, model)
         self._build_graph()
 
-    # ── Graph construction ────────────────────────────────────────────────────
+        # Load persistent episode memory if available
+        self._episode_buffer = None
+        self._try_load_episode_buffer()
+
+    # ── LLM Provider Resolution ───────────────────────────────────────────────
+
+    def _resolve_llm_provider(
+        self,
+        provider_override: Optional[str],
+        model_override: Optional[str],
+    ) -> None:
+        """Resolve LLM provider and store as self._llm_call callable."""
+        # ── AFTER (fixed) ─────────────────────────────────────────────────────────────
+        cfg = self.cfg.llm
+        # provider_override lets CLI force a specific backend; otherwise we use the flag.
+        preferred = provider_override or "auto"
+
+# ── 1. LocalLLM (default, fully offline) ──────────────────────────────────────
+# FIX: use_local_llm=True must always win, regardless of cfg.provider default.
+#      The old guard checked `preferred not in ("ollama",...)` but cfg.provider
+#      defaults to "ollama", so preferred was always "ollama" and LocalLLM
+#      was silently skipped.
+        if getattr(cfg, "use_local_llm", False) and preferred not in ("groq", "rule"):
+            try:
+                from arca.llm.local_llm import LocalLLM
+                llm = LocalLLM(
+                    model_key=model_override or getattr(cfg, "local_model_key", "llama-3.2-3b"),
+                    model_dir=getattr(cfg, "local_model_dir", str(Path.home() / ".arca" / "models")),
+                    n_gpu_layers=getattr(cfg, "local_n_gpu_layers", -1),
+                    auto_download=getattr(cfg, "auto_download_model", False),
+                )
+                if llm.available:
+                    self._local_llm_instance = llm   # NOTE: attribute, NOT method
+                    self._provider_name = f"LocalLLM ({llm._filename})"
+                    print(f"[ARCA Orchestrator] ✓ Provider: {self._provider_name}")
+
+                    # Store the bound method as a plain callable
+                    def _local_call(system: str, user: str, **kw) -> str:
+                        return llm.chat(
+                            system=system,
+                            user=user,
+                            max_tokens=getattr(cfg, "max_tokens", 512),
+                            temperature=getattr(cfg, "temperature", 0.2),
+                        )
+
+                    self._llm_call = _local_call
+                    return
+                else:
+                    print("[ARCA Orchestrator] LocalLLM not available (model file missing).")
+            except Exception as e:
+                print(f"[ARCA Orchestrator] LocalLLM init failed: {e}")
+
+        # ── 2. Ollama (local server) ───────────────────────────────────────────
+        if preferred in ("auto", "ollama"):
+            try:
+                import urllib.request
+                urllib.request.urlopen(
+                    getattr(cfg, "base_url", "http://localhost:11434") + "/api/tags",
+                    timeout=1.5,
+                )
+                import ollama as _ollama
+                self._provider_name = "Ollama"
+                print("[ARCA Orchestrator] ✓ Provider: Ollama")
+                _model = getattr(cfg, "model", "llama3.2")
+
+                def _ollama_call(system: str, user: str, **kw) -> str:
+                    resp = _ollama.chat(
+                        model=_model,
+                        messages=[
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user},
+                        ],
+                        options={"temperature": getattr(cfg, "temperature", 0.2)},
+                    )
+                    return resp["message"]["content"]
+
+                self._llm_call = _ollama_call
+                return
+            except Exception:
+                pass
+
+        # ── 3. Groq (remote, free API key) ────────────────────────────────────
+        import os
+        if os.getenv("GROQ_API_KEY") and preferred in ("auto", "groq"):
+            try:
+                from groq import Groq
+                client = Groq()
+                self._provider_name = "Groq"
+                print("[ARCA Orchestrator] ✓ Provider: Groq")
+
+                def _groq_call(system: str, user: str, **kw) -> str:
+                    resp = client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user},
+                        ],
+                        max_tokens=getattr(cfg, "max_tokens", 512),
+                        temperature=getattr(cfg, "temperature", 0.2),
+                    )
+                    return resp.choices[0].message.content
+
+                self._llm_call = _groq_call
+                return
+            except Exception:
+                pass
+
+        # ── 4. Rule-based fallback ─────────────────────────────────────────────
+        self._provider_name = "rule-based"
+        self._llm_call = None
+        print("[ARCA Orchestrator] Provider: rule-based fallback (no LLM available)")
+
+    def _call_llm(self, system: str, user: str) -> Optional[str]:
+        """
+        Safe internal dispatch to whichever LLM provider is active.
+        Returns None on failure or if no LLM is configured.
+        """
+        if self._llm_call is None:
+            return None
+        try:
+            result = self._llm_call(system=system, user=user)
+            if isinstance(result, str) and len(result.strip()) > 5:
+                return result.strip()
+            return None
+        except Exception as e:
+            print(f"[ARCA Orchestrator] LLM call failed: {e}")
+            return None
+
+    # ── Episode Memory ────────────────────────────────────────────────────────
+
+    def _try_load_episode_buffer(self) -> None:
+        try:
+            from arca.memory.episode_buffer import EpisodeBuffer
+            self._episode_buffer = EpisodeBuffer()
+        except Exception:
+            self._episode_buffer = None
+
+    def _format_memory_for_prompt(self) -> str:
+        """Return a compact past-episode summary for LLM context."""
+        if self._episode_buffer and len(self._episode_buffer) > 0:
+            return self._episode_buffer.format_for_llm(n=3)
+        if self._memory:
+            recent = self._memory[-3:]
+            lines = [
+                f"  Ep{i+1}: comp={m.get('compromised',0)} "
+                f"steps={m.get('steps',0)} r={m.get('reward',0):.1f}"
+                for i, m in enumerate(recent)
+            ]
+            return "\n".join(lines)
+        return "  No prior episodes."
+
+    # ── LangGraph Construction ─────────────────────────────────────────────────
 
     def _build_graph(self) -> None:
         try:
             from langgraph.graph import StateGraph, END
 
-            graph = StateGraph(ARCAGraphState)
-            graph.add_node("analyst",    self._analyst_node)
-            graph.add_node("attacker",   self._attacker_node)
-            graph.add_node("critic",     self._critic_node)
-            graph.add_node("reflector",  self._reflector_node)
-            graph.add_node("planner",    self._planner_node)
-            graph.add_node("remediator", self._remediator_node)
+            g = StateGraph(ARCAGraphState)
+            g.add_node("analyst",    self._analyst_node)
+            g.add_node("attacker",   self._attacker_node)
+            g.add_node("critic",     self._critic_node)
+            g.add_node("reflector",  self._reflector_node)
+            g.add_node("planner",    self._planner_node)
+            g.add_node("remediator", self._remediator_node)
 
-            graph.set_entry_point("analyst")
-            graph.add_edge("analyst",   "attacker")
-            graph.add_edge("attacker",  "critic")
-            graph.add_edge("critic",    "reflector")
-            graph.add_edge("reflector", "planner")
-            graph.add_edge("planner",   "remediator")
-            graph.add_edge("remediator", END)
+            g.set_entry_point("analyst")
+            for src, dst in [
+                ("analyst",    "attacker"),
+                ("attacker",   "critic"),
+                ("critic",     "reflector"),
+                ("reflector",  "planner"),
+                ("planner",    "remediator"),
+                ("remediator", END),
+            ]:
+                g.add_edge(src, dst)
 
-            self._graph = graph.compile()
+            self._graph = g.compile()
         except Exception as e:
-            print(f"[ARCA] LangGraph build failed ({e}). Sequential fallback active.")
+            print(f"[ARCA Orchestrator] LangGraph compile failed: {e}. Using sequential mode.")
             self._graph = None
 
-    # ── Node implementations ──────────────────────────────────────────────────
+    # ── Node Implementations ──────────────────────────────────────────────────
 
     def _analyst_node(self, state: ARCAGraphState) -> ARCAGraphState:
         ns = state["network_state"]
@@ -107,43 +254,45 @@ class ARCAOrchestrator:
         ep = ns.get("episode_info", {})
 
         compromised = [
-            f"Host {hid} ({h.get('name', h.get('ip', hid))}, {h.get('os')})"
-            for hid, h in hosts.items() if h.get("status") == "COMPROMISED"
+            f"H{hid}({h.get('os','?')})"
+            for hid, h in hosts.items()
+            if h.get("status") == "COMPROMISED"
         ]
         discovered = [
-            f"Host {hid} ({h.get('name', h.get('ip', hid))}, {h.get('os')}, vulns: {h.get('vulnerabilities', [])})"
-            for hid, h in hosts.items() if h.get("discovered") and h.get("status") != "COMPROMISED"
+            f"H{hid}({h.get('os','?')})"
+            for hid, h in hosts.items()
+            if h.get("discovered") and h.get("status") != "COMPROMISED"
         ]
-        undiscovered_count = sum(1 for h in hosts.values() if not h.get("discovered"))
+        crit_not_owned = [
+            hid for hid, h in hosts.items()
+            if h.get("is_critical") and h.get("status") != "COMPROMISED"
+        ]
 
-        prompt = f"""You are a senior cybersecurity analyst reviewing a penetration test in progress.
+        system = (
+            "You are a senior cybersecurity red-team analyst. "
+            "Be concise and focus on actionable insights."
+        )
+        user = (
+            f"Network: {ns.get('network_name', 'Unknown')} | Step: {ns.get('step', 0)}\n"
+            f"Compromised ({len(compromised)}): {compromised}\n"
+            f"Discovered not owned ({len(discovered)}): {discovered[:4]}\n"
+            f"Critical unowned: {crit_not_owned}\n"
+            f"Reward: {ep.get('total_reward', 0):.1f} | Path: {ep.get('attack_path', [])}\n"
+            f"Past sessions:\n{self._format_memory_for_prompt()}\n"
+            "In 2 sentences: describe the situation and the highest-priority target."
+        )
 
-NETWORK: {ns.get('network_name', 'Unknown')}
-STEP: {ns.get('step', 0)}
-ATTACKER POSITION: Host {ns.get('attacker_node', 0)} — {hosts.get(str(ns.get('attacker_node', 0)), {}).get('ip', 'unknown')}
-
-COMPROMISED HOSTS ({len(compromised)}):
-{chr(10).join(f'  ✓ {c}' for c in compromised) or '  None yet'}
-
-DISCOVERED (not yet compromised) ({len(discovered)}):
-{chr(10).join(f'  ~ {d}' for d in discovered[:5]) or '  None yet'}
-
-UNDISCOVERED: {undiscovered_count} hosts
-TOTAL REWARD: {ep.get('total_reward', 0):.1f}
-ATTACK PATH: {' → '.join(ep.get('attack_path', [])) or 'None yet'}
-
-In 3 sentences: describe the current attack situation, what the attacker controls, and what the most valuable remaining targets are."""
-
-        output = self._llm_call(prompt) or self._rule_analyst(ns)
+        output = self._call_llm(system, user) or self._rule_analyst(ns)
         state["analyst_output"] = output
 
-        # Compute severity score (0-10)
+        # Severity score (0–10)
         total = max(len(hosts), 1)
-        comp = len(compromised)
-        crit_comp = sum(1 for h in hosts.values()
-                        if h.get("status") == "COMPROMISED" and h.get("is_critical"))
+        n_comp = len(compromised)
+        n_crit = sum(1 for h in hosts.values()
+                     if h.get("status") == "COMPROMISED" and h.get("is_critical"))
         state["severity_score"] = min(10.0, round(
-            (comp / total) * 5.0 + crit_comp * 2.5 + (1 if len(ep.get("attack_path", [])) > 0 else 0), 1
+            (n_comp / total) * 5.0 + n_crit * 2.5 +
+            (1.0 if ep.get("attack_path") else 0.0), 1
         ))
         return state
 
@@ -151,35 +300,36 @@ In 3 sentences: describe the current attack situation, what the attacker control
         ns = state["network_state"]
         hosts = ns.get("hosts", {})
 
-        # Build rich host table
         host_lines = []
         for hid, h in hosts.items():
-            vulns = h.get("vulnerabilities", [])
-            vuln_str = ", ".join(f"{v if isinstance(v, str) else v.get('name','?')}({v.get('exploit_prob',0.5)*100:.0f}%)" if isinstance(v, dict) else v for v in vulns[:3])
+            vulns = ", ".join(
+                f"{v.get('name','?')}({v.get('exploit_prob',0.5)*100:.0f}%)"
+                if isinstance(v, dict) else str(v)
+                for v in h.get("vulnerabilities", [])[:3]
+            )
+            status = "COMP" if h.get("status") == "COMPROMISED" else (
+                "DISC" if h.get("discovered") else "?"
+            )
             host_lines.append(
-                f"  [{hid}] {h.get('ip','?'):<16} {h.get('os','?'):<10} "
-                f"{'COMPROMISED' if h.get('status')=='COMPROMISED' else 'DISCOVERED' if h.get('discovered') else 'UNKNOWN':<12} "
-                f"critical={h.get('is_critical',False)} firewall={h.get('firewall',False)} "
-                f"vulns=[{vuln_str}]"
+                f"  [{hid}] {h.get('os','?'):<10} {status:<5} "
+                f"crit={h.get('is_critical',False)} fw={h.get('firewall',False)} "
+                f"vulns=[{vulns}]"
             )
 
-        prompt = f"""You are a penetration tester AI planning the next move.
+        system = (
+            "You are an elite penetration tester AI. "
+            "Recommend precise, stealthy actions — avoid noisy scans of already-known hosts."
+        )
+        user = (
+            f"{state.get('analyst_output', '')}\n"
+            f"Attacker position: Host {ns.get('attacker_node', 0)}\n"
+            "HOST TABLE:\n" + "\n".join(host_lines) + "\n\n"
+            "Recommend ONE action: target host ID, action type "
+            "(SCAN/EXPLOIT/PIVOT/EXFILTRATE), vulnerability name, and why. "
+            "Prefer high-probability exploits on critical/high-value hosts."
+        )
 
-{state.get('analyst_output', '')}
-
-DETAILED HOST STATUS:
-{chr(10).join(host_lines)}
-
-CURRENT POSITION: Host {ns.get('attacker_node', 0)}
-
-As the attacker, identify:
-1. The single best next exploit (highest probability, most impactful)
-2. Best pivot path to reach critical/high-value hosts
-3. Any quick wins (firewall=false + high exploit_prob)
-
-Be specific: name the target host ID, the CVE/vuln, and why it's the best move."""
-
-        output = self._llm_call(prompt) or self._rule_attacker(ns)
+        output = self._call_llm(system, user) or self._rule_attacker(ns)
         state["attacker_output"] = output
         return state
 
@@ -187,65 +337,48 @@ Be specific: name the target host ID, the CVE/vuln, and why it's the best move."
         ns = state["network_state"]
         ep = ns.get("episode_info", {})
         hosts = ns.get("hosts", {})
-
+        total = max(len(hosts), 1)
         comp = ep.get("hosts_compromised", 0)
         disc = ep.get("hosts_discovered", 0)
-        total = len(hosts)
-        steps = ns.get("step", 1)
+        steps = max(ns.get("step", 1), 1)
         reward = ep.get("total_reward", 0)
 
-        efficiency = comp / max(steps, 1) * 100
-        discovery_ratio = disc / max(total, 1)
-        exploit_ratio = comp / max(disc, 1) if disc > 0 else 0
+        system = "You are a strict red-team performance evaluator."
+        user = (
+            f"Compromised: {comp}/{total} | Discovered: {disc}/{total} | Steps: {steps}\n"
+            f"Efficiency: {comp / steps * 100:.1f} compromises/100steps | Reward: {reward:.1f}\n"
+            f"Analyst: {state.get('analyst_output', '')[:180]}\n"
+            f"Attacker plan: {state.get('attacker_output', '')[:180]}\n"
+            "3 bullet critique:\n"
+            "• Main inefficiency\n• Best missed opportunity\n• Defender risk level (Low/Medium/High/Critical)"
+        )
 
-        prompt = f"""You are a red team exercise evaluator critiquing an RL agent's performance.
-
-PERFORMANCE METRICS:
-  Steps taken: {steps}
-  Hosts discovered: {disc}/{total} ({discovery_ratio*100:.0f}%)
-  Hosts compromised: {comp}/{total} ({comp/total*100:.0f}%)
-  Exploit success rate: {exploit_ratio*100:.0f}% (of discovered)
-  Actions per compromise: {steps/max(comp,1):.1f}
-  Total reward: {reward:.1f}
-  Efficiency score: {efficiency:.2f} compromises/100 steps
-
-ANALYST ASSESSMENT: {state.get('analyst_output', '')[:200]}
-ATTACKER PLAN: {state.get('attacker_output', '')[:200]}
-
-Critique in 3 points:
-1. What is the agent doing wrong / inefficiently?
-2. What opportunities is it missing?
-3. What is the risk level for the defender? (Low/Medium/High/Critical)"""
-
-        output = self._llm_call(prompt) or self._rule_critic(ns)
+        output = self._call_llm(system, user) or self._rule_critic(ns)
         state["critic_output"] = output
         return state
 
     def _reflector_node(self, state: ARCAGraphState) -> ARCAGraphState:
-        history = state.get("episode_history", [])
-        recent = history[-3:] if history else []
+        history = state.get("episode_history", [])[-3:]
         hist_str = "\n".join(
-            f"  Episode {i+1}: comp={h.get('compromised',0)}, steps={h.get('steps',0)}, reward={h.get('reward',0):.1f}"
-            for i, h in enumerate(recent)
-        ) if recent else "  No previous episodes"
+            f"  Ep{i+1}: comp={h.get('compromised',0)} "
+            f"steps={h.get('steps',0)} r={h.get('reward',0):.1f}"
+            for i, h in enumerate(history)
+        ) or "  No prior episodes in this session."
 
-        prompt = f"""You are an RL training coach analyzing an agent's learning progress.
+        system = "You are an RL training coach for a cybersecurity agent."
+        user = (
+            f"Performance critique:\n{state.get('critic_output','')[:280]}\n\n"
+            f"Session history:\n{hist_str}\n\n"
+            f"All-time memory:\n{self._format_memory_for_prompt()}\n\n"
+            "Provide exactly 2 lessons (1 sentence each):\n"
+            "Lesson 1: What behaviour to reinforce (e.g., 'prioritise X').\n"
+            "Lesson 2: What behaviour to avoid (e.g., 'stop doing Y')."
+        )
 
-CURRENT EPISODE CRITIQUE:
-{state.get('critic_output', '')[:300]}
-
-RECENT EPISODE HISTORY:
-{hist_str}
-
-SEVERITY SCORE: {state.get('severity_score', 0)}/10
-
-Provide 2 key lessons:
-1. What behavioral pattern should the agent reinforce?
-2. What behavior should it avoid in future episodes?
-
-Be specific and actionable (max 2 sentences each)."""
-
-        output = self._llm_call(prompt) or "1. Scan before exploit. 2. Prioritize critical hosts."
+        output = self._call_llm(system, user) or (
+            "Lesson 1: Prioritise exploiting critical hosts early for high rewards. "
+            "Lesson 2: Avoid scanning already-discovered hosts — exploit them instead."
+        )
         state["reflection"] = output
         return state
 
@@ -253,42 +386,33 @@ Be specific and actionable (max 2 sentences each)."""
         ns = state["network_state"]
         hosts = ns.get("hosts", {})
 
-        # Find best targets
         undiscovered = [hid for hid, h in hosts.items() if not h.get("discovered")]
-        exploitable = [
-            (hid, h) for hid, h in hosts.items()
-            if h.get("discovered") and h.get("status") != "COMPROMISED"
-        ]
-        # Sort exploitable by highest exploit prob
-        if exploitable:
-            def best_prob(item):
-                vulns = item[1].get("vulnerabilities", [])
-                return max((v.get("exploit_prob", 0) if isinstance(v, dict) else 0.5
-                            for v in vulns), default=0)
-            exploitable.sort(key=best_prob, reverse=True)
-
+        exploitable = sorted(
+            [(hid, h) for hid, h in hosts.items()
+             if h.get("discovered") and h.get("status") != "COMPROMISED"],
+            key=lambda x: max(
+                (v.get("exploit_prob", 0) if isinstance(v, dict) else 0.5
+                 for v in x[1].get("vulnerabilities", [])),
+                default=0.0
+            ),
+            reverse=True,
+        )
         critical_unowned = [
             hid for hid, h in hosts.items()
             if h.get("is_critical") and h.get("status") != "COMPROMISED"
         ]
 
-        prompt = f"""You are a penetration testing planner creating a concrete action sequence.
+        system = "You are a precision penetration testing planner."
+        user = (
+            f"Reflection: {state.get('reflection','')[:200]}\n"
+            f"Attacker insight: {state.get('attacker_output','')[:200]}\n\n"
+            f"Undiscovered: {undiscovered[:4]}\n"
+            f"Exploitable (sorted by prob): {[h for h, _ in exploitable[:4]]}\n"
+            f"Critical unowned: {critical_unowned}\n\n"
+            "Generate EXACTLY 5 steps:\nSTEP N: [ACTION] on Host [ID] — [brief reason]"
+        )
 
-REFLECTION: {state.get('reflection', '')[:200]}
-ATTACKER INSIGHTS: {state.get('attacker_output', '')[:200]}
-
-AVAILABLE TARGETS:
-  Undiscovered hosts: {undiscovered[:5]}
-  Exploitable (discovered): {[h for h, _ in exploitable[:5]]}
-  Critical targets not yet owned: {critical_unowned}
-
-Generate a prioritized action plan with exactly 5 steps.
-Format each step as:
-  STEP N: [ACTION] on Host [ID] — [reason and expected outcome]
-
-Actions: SCAN | EXPLOIT | PIVOT | EXFILTRATE"""
-
-        output = self._llm_call(prompt) or self._rule_plan(ns)
+        output = self._call_llm(system, user) or self._rule_plan(ns)
         state["plan"] = output
         return state
 
@@ -297,68 +421,175 @@ Actions: SCAN | EXPLOIT | PIVOT | EXFILTRATE"""
         hosts = ns.get("hosts", {})
         ep = ns.get("episode_info", {})
 
-        # Gather all exploited vulnerabilities
-        attack_path = ep.get("attack_path", [])
-        compromised_details = [
-            f"  - {h.get('ip','?')} ({h.get('os','?')}): vulns={h.get('vulnerabilities',[])}"
-            for hid, h in hosts.items() if h.get("status") == "COMPROMISED"
-        ]
+        exploited_vulns = sorted({
+            v.get("name", "?")
+            for h in hosts.values()
+            if h.get("status") == "COMPROMISED"
+            for v in h.get("vulnerabilities", [])
+            if isinstance(v, dict)
+        })
 
-        prompt = f"""You are a defensive security engineer (blue team) analyzing a completed penetration test.
+        system = "You are a senior defensive security engineer (blue team)."
+        user = (
+            f"Attack path: {ep.get('attack_path', [])}\n"
+            f"Severity score: {state.get('severity_score', 0):.1f}/10\n"
+            f"Exploited vulnerabilities: {exploited_vulns[:6]}\n\n"
+            "Prioritised remediation report:\n"
+            "CRITICAL (fix within 24h): ...\n"
+            "HIGH (fix within 1 week): ...\n"
+            "MEDIUM (fix within 1 month): ...\n"
+            "QUICK WINS (immediate, low-effort): ..."
+        )
 
-ATTACK PATH: {' → '.join(attack_path) or 'No successful exploits'}
-SEVERITY SCORE: {state.get('severity_score', 0)}/10
-COMPROMISED HOSTS:
-{chr(10).join(compromised_details) or '  None'}
-
-Generate a prioritized remediation report with:
-1. CRITICAL (fix within 24h): Patch or mitigate most dangerous vulnerabilities
-2. HIGH (fix within 1 week): Network segmentation and access controls
-3. MEDIUM (fix within 1 month): Monitoring, logging, credential hygiene
-4. QUICK WINS: Immediate low-effort improvements (firewall rules, default creds)
-
-Be specific — name CVEs, suggest exact patches or config changes."""
-
-        output = self._llm_call(prompt) or self._rule_remediation(ns)
+        output = self._call_llm(system, user) or self._rule_remediation(ns)
         state["remediation"] = output
         return state
 
-    # ── Public interface ──────────────────────────────────────────────────────
+    # ── Rule-based Fallbacks ──────────────────────────────────────────────────
+
+    def _rule_analyst(self, ns: dict) -> str:
+        hosts = ns.get("hosts", {})
+        ep = ns.get("episode_info", {})
+        comp = ep.get("hosts_compromised", 0)
+        total = max(len(hosts), 1)
+        crit_owned = sum(1 for h in hosts.values()
+                         if h.get("status") == "COMPROMISED" and h.get("is_critical"))
+        return (
+            f"Agent controls {comp}/{total} hosts "
+            f"({crit_owned} critical) from position H{ns.get('attacker_node', 0)}. "
+            f"Progress: {comp / total * 100:.0f}% network penetration."
+        )
+
+    def _rule_attacker(self, ns: dict) -> str:
+        hosts = ns.get("hosts", {})
+        best_target, best_prob = None, 0.0
+        for hid, h in hosts.items():
+            if h.get("discovered") and h.get("status") != "COMPROMISED":
+                for v in h.get("vulnerabilities", []):
+                    p = v.get("exploit_prob", 0) if isinstance(v, dict) else 0.5
+                    if p > best_prob and not h.get("firewall", False):
+                        best_prob = p
+                        best_target = (hid, h, v)
+        if best_target:
+            hid, h, v = best_target
+            return (
+                f"EXPLOIT Host {hid} ({h.get('ip','?')}, {h.get('os','?')}) "
+                f"via {v.get('name','?')} — {best_prob*100:.0f}% success probability."
+            )
+        undiscovered = [hid for hid, h in hosts.items() if not h.get("discovered")]
+        if undiscovered:
+            return f"SCAN Host {undiscovered[0]} — no exploitable discovered hosts yet."
+        return "All reachable hosts discovered. PIVOT to expand attack surface."
+
+    def _rule_critic(self, ns: dict) -> str:
+        ep = ns.get("episode_info", {})
+        comp = ep.get("hosts_compromised", 0)
+        disc = ep.get("hosts_discovered", 0)
+        if disc == 0:
+            return (
+                "• No hosts discovered — agent is not scanning.\n"
+                "• Reconnaissance phase entirely missed.\n"
+                "• Risk: Low (no actual penetration)."
+            )
+        ratio = comp / max(disc, 1)
+        if ratio < 0.3:
+            return (
+                "• Low exploit-to-discovery ratio — discovering but not compromising.\n"
+                "• High-probability vulnerabilities likely being skipped.\n"
+                "• Risk: Medium — partial foothold."
+            )
+        return (
+            f"• Good progress: {comp} hosts compromised.\n"
+            "• Should target critical/high-value hosts next.\n"
+            "• Risk: High — significant attacker foothold."
+        )
+
+    def _rule_plan(self, ns: dict) -> str:
+        hosts = ns.get("hosts", {})
+        steps = []
+        for hid, h in hosts.items():
+            if not h.get("discovered"):
+                steps.append(f"STEP 1: SCAN Host {hid} — discover new attack surface")
+                break
+        for hid, h in sorted(
+            [(k, v) for k, v in hosts.items()
+             if v.get("discovered") and v.get("status") != "COMPROMISED"],
+            key=lambda x: max(
+                (vv.get("exploit_prob", 0) if isinstance(vv, dict) else 0.5
+                 for vv in x[1].get("vulnerabilities", [])), default=0
+            ),
+            reverse=True,
+        )[:1]:
+            steps.append(f"STEP 2: EXPLOIT Host {hid} — highest-probability target")
+        for hid, h in hosts.items():
+            if h.get("is_critical") and h.get("status") != "COMPROMISED":
+                steps.append(f"STEP 3: EXPLOIT Host {hid} (CRITICAL) — crown jewel")
+                break
+        steps.append("STEP 4: PIVOT to furthest compromised host to expand reach")
+        steps.append("STEP 5: EXFILTRATE from highest data_value compromised host")
+        return "\n".join(steps) or "STEP 1: SCAN all reachable hosts"
+
+    def _rule_remediation(self, ns: dict) -> str:
+        hosts = ns.get("hosts", {})
+        vulns = {
+            v.get("name", "?")
+            for h in hosts.values()
+            if h.get("status") == "COMPROMISED"
+            for v in h.get("vulnerabilities", [])
+            if isinstance(v, dict)
+        }
+        vstr = ", ".join(list(vulns)[:4]) or "identified vulnerabilities"
+        return (
+            f"CRITICAL (24h): Emergency patch {vstr}. "
+            "Isolate compromised hosts immediately.\n"
+            "HIGH (1 week): Network segmentation — IoT to separate VLAN. "
+            "Enable host-based firewalls on all endpoints.\n"
+            "MEDIUM (1 month): Deploy SIEM with alert rules. "
+            "Enable MFA on all privileged accounts. Audit logging.\n"
+            "QUICK WINS: Change all default credentials immediately. "
+            "Disable Telnet and unused services. Update firmware."
+        )
+
+    # ── Public Interface ──────────────────────────────────────────────────────
 
     def step(self, network_state: dict) -> dict:
         """Run full analysis graph on current network state."""
-        initial_state: ARCAGraphState = {
-            "network_state": network_state,
-            "analyst_output": "",
+        initial: ARCAGraphState = {
+            "network_state":   network_state,
+            "analyst_output":  "",
             "attacker_output": "",
-            "critic_output": "",
-            "reflection": "",
-            "plan": "",
-            "remediation": "",
-            "severity_score": 0.0,
+            "critic_output":   "",
+            "reflection":      "",
+            "plan":            "",
+            "remediation":     "",
+            "severity_score":  0.0,
             "episode_history": self._memory[-5:],
         }
 
         if self._graph:
-            result = self._graph.invoke(initial_state)
+            result = self._graph.invoke(initial)
         else:
-            # Sequential fallback
-            result = initial_state.copy()
-            for node in [
-                self._analyst_node, self._attacker_node, self._critic_node,
-                self._reflector_node, self._planner_node, self._remediator_node,
+            # Sequential fallback when LangGraph compile failed
+            result = dict(initial)
+            for node_fn in [
+                self._analyst_node,
+                self._attacker_node,
+                self._critic_node,
+                self._reflector_node,
+                self._planner_node,
+                self._remediator_node,
             ]:
-                result = node(result)
+                result = node_fn(result)
 
-        # Store in memory
+        # Store in session memory
         ep = network_state.get("episode_info", {})
         self._memory.append({
-            "step": network_state.get("step"),
+            "step":        network_state.get("step", 0),
             "compromised": ep.get("hosts_compromised", 0),
-            "steps": network_state.get("step", 0),
-            "reward": ep.get("total_reward", 0),
-            "severity": result.get("severity_score", 0),
-            "reflection": result.get("reflection", ""),
+            "steps":       network_state.get("step", 0),
+            "reward":      ep.get("total_reward", 0.0),
+            "severity":    result.get("severity_score", 0.0),
+            "reflection":  result.get("reflection", ""),
         })
 
         return result
@@ -370,102 +601,4 @@ Be specific — name CVEs, suggest exact patches or config changes."""
         return self._memory
 
     def get_provider_name(self) -> str:
-        return self._provider.name
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _llm_call(self, prompt: str) -> Optional[str]:
-        try:
-            result = self._provider.complete(prompt, max_tokens=self.cfg.llm.max_tokens)
-            if result and len(result) > 10:
-                return result
-        except Exception as e:
-            print(f"[ARCA] LLM call failed: {e}. Using rule-based.")
-        return None
-
-    def _rule_analyst(self, ns: dict) -> str:
-        hosts = ns.get("hosts", {})
-        ep = ns.get("episode_info", {})
-        comp = ep.get("hosts_compromised", 0)
-        disc = ep.get("hosts_discovered", 0)
-        total = len(hosts)
-        critical_owned = sum(1 for h in hosts.values()
-                             if h.get("status") == "COMPROMISED" and h.get("is_critical"))
-        return (
-            f"Agent controls {comp}/{total} hosts ({disc} discovered) "
-            f"from position Host {ns.get('attacker_node', 0)}. "
-            f"Critical hosts owned: {critical_owned}. "
-            f"Progress: {comp/max(total,1)*100:.0f}% network penetration."
-        )
-
-    def _rule_attacker(self, ns: dict) -> str:
-        hosts = ns.get("hosts", {})
-        best_target = None
-        best_prob = 0
-        for hid, h in hosts.items():
-            if h.get("discovered") and h.get("status") != "COMPROMISED":
-                for v in h.get("vulnerabilities", []):
-                    p = v.get("exploit_prob", 0) if isinstance(v, dict) else 0.5
-                    if p > best_prob and not h.get("firewall", False):
-                        best_prob = p
-                        best_target = (hid, h, v)
-        if best_target:
-            hid, h, v = best_target
-            return f"Best target: Host {hid} ({h.get('ip')}) via {v.get('name','?')} ({best_prob*100:.0f}% success rate)."
-        return "All reachable hosts discovered. Focus on pivoting to new subnets."
-
-    def _rule_critic(self, ns: dict) -> str:
-        ep = ns.get("episode_info", {})
-        comp = ep.get("hosts_compromised", 0)
-        disc = ep.get("hosts_discovered", 0)
-        total = len(ns.get("hosts", {}))
-        if disc == 0:
-            return "1. No hosts discovered. 2. Agent not scanning. 3. Risk: Low (no penetration)."
-        ratio = comp / max(disc, 1)
-        if ratio < 0.3:
-            return (
-                "1. Low exploit success — agent discovering but not compromising. "
-                "2. Missing high-probability vulns. "
-                "3. Risk: Medium."
-            )
-        return (
-            f"1. Reasonable progress ({comp}/{total} hosts). "
-            "2. Should target critical hosts next. "
-            "3. Risk: High — attacker has significant foothold."
-        )
-
-    def _rule_plan(self, ns: dict) -> str:
-        hosts = ns.get("hosts", {})
-        undiscovered = [hid for hid, h in hosts.items() if not h.get("discovered")]
-        exploitable = [hid for hid, h in hosts.items()
-                       if h.get("discovered") and h.get("status") != "COMPROMISED"]
-        critical = [hid for hid, h in hosts.items()
-                    if h.get("is_critical") and h.get("status") != "COMPROMISED"]
-        steps = []
-        if undiscovered:
-            steps.append(f"STEP 1: SCAN Host {undiscovered[0]} — discover new hosts in network")
-        if exploitable:
-            steps.append(f"STEP 2: EXPLOIT Host {exploitable[0]} — compromise discovered host")
-        if critical:
-            steps.append(f"STEP 3: EXPLOIT Host {critical[0]} (CRITICAL) — high-value target")
-        if exploitable:
-            steps.append(f"STEP 4: PIVOT to compromised host — expand attack surface")
-        steps.append("STEP 5: EXFILTRATE from highest data_value compromised host")
-        return "\n".join(steps) if steps else "STEP 1: SCAN all reachable hosts"
-
-    def _rule_remediation(self, ns: dict) -> str:
-        hosts = ns.get("hosts", {})
-        compromised_vulns = []
-        for h in hosts.values():
-            if h.get("status") == "COMPROMISED":
-                for v in h.get("vulnerabilities", []):
-                    if isinstance(v, dict):
-                        compromised_vulns.append(v.get("name", "unknown"))
-
-        vuln_str = ", ".join(set(compromised_vulns[:5])) if compromised_vulns else "None identified"
-        return (
-            f"CRITICAL (24h): Patch {vuln_str}. Apply emergency security updates.\n"
-            "HIGH (1 week): Enable host firewall on all endpoints. Segment IoT to separate VLAN.\n"
-            "MEDIUM (1 month): Deploy SIEM, enable audit logging, enforce MFA.\n"
-            "QUICK WINS: Change all default credentials, disable Telnet/unused services."
-        )
+        return self._provider_name

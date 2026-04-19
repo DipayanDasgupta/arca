@@ -1,41 +1,95 @@
 [project]
 name = "arca-agent"
-version = "0.2.6"
-description = "ARCA — Local RL-powered Autonomous Cyber Pentesting Agent with LangGraph"
+version = "0.3.0"
+description = "ARCA — Recursive GNN+RL Autonomous Cyber Agent with Local LLM reflection"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "Dipayan Dasgupta", email = "deep.dasgupta2006@gmail.com"}]
-keywords = ["reinforcement-learning", "cybersecurity", "pentesting", "langgraph", "agentic-ai", "pybind11"]
+keywords = [
+    "reinforcement-learning", "cybersecurity", "pentesting",
+    "langgraph", "agentic-ai", "graph-neural-network", "pybind11",
+    "autonomous-agent", "local-llm"
+]
 
+# ── Core dependencies (CPU-safe, always installed) ───────────────────────────
 dependencies = [
-    "numpy>=1.24", "gymnasium>=0.29", "stable-baselines3>=2.2",
-    "networkx>=3.0", "torch>=2.0", "fastapi>=0.110",
-    "uvicorn[standard]>=0.29", "pydantic>=2.0", "rich>=13.0",
-    "typer>=0.12", "matplotlib>=3.8", "plotly>=5.20",
-    "langgraph>=0.1", "langchain>=0.2", "ollama>=0.2",
-    "pyyaml>=6.0", "pandas>=2.0"
+    # Numerics + RL env
+    "numpy>=1.26",
+    "gymnasium>=1.0",
+    "networkx>=3.3",
+
+    # PyTorch (CPU wheel by default; GPU via extras)
+    "torch>=2.3.0",
+
+    # PyTorch Geometric (graph neural networks)
+    "torch-geometric>=2.5.0",
+
+    # Local LLM (optional at runtime, listed here so pip resolves it)
+    "llama-cpp-python>=0.3.0",
+
+    # LangGraph orchestration
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    "langchain>=0.3",
+
+    # API + CLI + viz
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.0",
+    "rich>=13.0",
+    "typer>=0.12",
+    "matplotlib>=3.8",
+    "plotly>=5.20",
+    "pandas>=2.0",
+    "pyyaml>=6.0",
+
+    # TensorBoard
+    "tensorboard>=2.17",
+
+    # HTTP (for connectors)
+    "httpx>=0.27",
+    "ollama>=0.2",
 ]
 
 [project.urls]
-Homepage = "https://github.com/DipayanDasgupta/arca"
+Homepage   = "https://github.com/DipayanDasgupta/arca"
 Repository = "https://github.com/DipayanDasgupta/arca"
 
 [project.optional-dependencies]
-dev = ["pytest", "black", "ruff", "mypy"]
+# GPU training: install CUDA-enabled torch + PyG separately (see INSTALL.md)
+gpu = [
+    "stable-baselines3>=2.3",   # kept for legacy mode
+]
+
+# Stable-Baselines3 (legacy / use_gnn=False mode)
+sb3 = [
+    "stable-baselines3>=2.3",
+]
+
+# C++ acceleration
 cpp = ["pybind11>=2.11"]
-viz = ["dash>=2.16"]
-all = ["pybind11>=2.11", "dash>=2.16", "ollama>=0.2"]
+
+# Dev + test
+dev = ["pytest", "pytest-cov", "black", "ruff", "mypy"]
+
+# Everything
+all = [
+    "stable-baselines3>=2.3",
+    "pybind11>=2.11",
+    "dash>=2.16",
+    "groq>=0.5",
+]
 
 [project.scripts]
 arca = "arca.cli.main:main"
 
 [build-system]
-requires = ["setuptools>=68", "wheel", "pybind11>=2.11"]
+requires      = ["setuptools>=68", "wheel", "pybind11>=2.11"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where   = ["."]
 include = ["arca*"]
 exclude = ["tests*", "examples*"]
 
@@ -44,4 +98,4 @@ exclude = ["tests*", "examples*"]
 
 [tool.setuptools]
 include-package-data = true
-zip-safe = false
+zip-safe             = false
