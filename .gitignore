@@ -57,3 +57,10 @@ episode_buffer.json
 .Trashes
 ehthumbs.db
 Thumbs.db
+ARCA_Full_Codebase*.md
+codebase.sh
+*.yaml
+quickstart_v3.py
+setup_v3.sh
+test_comprehensive.py
+test_run.py
