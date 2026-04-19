@@ -1,16 +1,15 @@
 """
-arca/core/agent.py  (v3.3)
+arca/core/agent.py  (v3.5)
 ===========================
-Fixes vs v3.2:
-  - run_curriculum(): removed duplicate self.env = scheduler.make_env() call
-  - run_curriculum(): passes eval rewards into scheduler for reward-based promotion
-  - reflect(): builds query_record and passes to orchestrator for proper RAG
-  - enable_vector_memory(): also attaches vm to orchestrator if present
-  - _make_reflection_callback(): attaches vector_memory context
-  - offline_rl_finetune(): new method — BC fine-tune on top episodes
+Changes vs v3.4:
+  - run_curriculum(): uses tiers_trained set to prevent double-training
+  - run_curriculum(): restores env to last trained env after loop
+  - run_curriculum(): returns per-tier timing in history entries
+  - All other logic unchanged
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -135,7 +134,6 @@ class ARCAAgent:
 
             return local_reflect
 
-        # Fallback: orchestrator
         def orchestrator_reflect(state: dict) -> str:
             try:
                 self.enable_langgraph()
@@ -155,10 +153,13 @@ class ARCAAgent:
         max_tiers:          int = 5,
     ) -> list[dict]:
         """
-        Train through curriculum tiers.
-        Returns list of status dicts recorded after each tier's eval.
+        Train through curriculum tiers, advancing when performance thresholds
+        are met.  Each tier is trained EXACTLY ONCE — re-entry to the same
+        tier only adds eval episodes, it does NOT re-train.
+
+        Returns list of status dicts (one per tier transition) plus timing.
         """
-        from arca.training.curriculum import CurriculumScheduler
+        from arca.training.curriculum import CurriculumScheduler, TIERS
 
         scheduler = CurriculumScheduler(
             start_tier = start_tier,
@@ -168,33 +169,75 @@ class ARCAAgent:
         self.env = scheduler.make_env()
         history  = []
 
-        for _ in range(max_tiers):
-            print(
-                f"\n[Curriculum] ── Tier {scheduler.tier_idx}: "
-                f"{scheduler.tier_name}  "
-                f"({scheduler.tier.num_hosts} hosts) ──"
-            )
-            # Rebuild trainer for new env / tier settings
-            self._trainer = None
-            self._model   = None
-            self.train(timesteps=timesteps_per_tier)
+        # Track which tier indices have already been trained (prevent double-train)
+        tiers_trained:   set[int] = set()
+        # Keep a reference to the env that matched the last trained model
+        last_trained_env: NetworkEnv = self.env
+        # Per-tier timing
+        tier_times: dict[str, float] = {}
 
-            # Evaluate against current tier env
-            tier_changed = False
-            for _ in range(eval_episodes):
+        # Allow up to max_tiers * 2 outer iterations so that tiers with large
+        # promotion windows can accumulate enough eval episodes without causing
+        # a second training run on the same tier.
+        max_iterations = max(max_tiers, len(TIERS)) * 2
+
+        for iteration in range(max_iterations):
+            current_tier_idx  = scheduler.tier_idx
+            current_tier_name = scheduler.tier_name
+            current_tier      = scheduler.tier
+
+            # ── Train only if we haven't visited this tier yet ─────────────
+            if current_tier_idx not in tiers_trained:
+                print(
+                    f"\n[Curriculum] ── Tier {current_tier_idx}: "
+                    f"{current_tier_name}  "
+                    f"({current_tier.num_hosts} hosts, "
+                    f"promote_r≥{current_tier.promote_reward_threshold:.0f}) ──"
+                )
+                # Reset trainer so the new tier env creates a fresh GNN with
+                # the correct action-space size for this tier.
+                self._trainer = None
+                self._model   = None
+
+                t_start = time.time()
+                self.train(timesteps=timesteps_per_tier)
+                elapsed = time.time() - t_start
+
+                tiers_trained.add(current_tier_idx)
+                last_trained_env = self.env          # remember for post-curriculum eval
+                tier_times[current_tier_name] = elapsed
+            else:
+                print(
+                    f"  [Curriculum] Continuing eval on {current_tier_name} "
+                    f"(already trained — filling promotion window)"
+                )
+
+            # ── Eval — run enough episodes to fill the promotion window ────
+            # The scheduler needs at least (window // 2) samples to trigger
+            # promotion.  We overshoot slightly to avoid borderline cases.
+            n_eval_this_iter = max(eval_episodes, current_tier.window + 2)
+            for _ in range(n_eval_this_iter):
                 ep      = self.run_episode()
                 changed = scheduler.record(ep.goal_reached, ep.total_reward)
                 if changed:
-                    # BUG FIX v3.3: was called twice (duplicate)
+                    # Tier changed: switch env to the new tier
                     self.env = scheduler.make_env()
-                    tier_changed = True
                     break
 
-            history.append(scheduler.status())
+            history.append({
+                **scheduler.status(),
+                "elapsed_s": tier_times.get(current_tier_name, 0.0),
+            })
 
             if scheduler.is_at_max:
                 print("[Curriculum] Reached maximum difficulty tier.")
                 break
+
+        # ── Post-curriculum: restore env to match the last trained model ───
+        # This prevents a size-mismatch when run_episode() is called after
+        # run_curriculum() returns.  gnn_policy._apply_mask (v3.5) also handles
+        # any residual mismatch gracefully.
+        self.env = last_trained_env
 
         return history
 
@@ -282,7 +325,6 @@ class ARCAAgent:
     def enable_langgraph(self) -> "ARCAAgent":
         from arca.agents.langgraph_orchestrator import ARCAOrchestrator
         self._langgraph = ARCAOrchestrator(cfg=self.cfg)
-        # Attach vector memory if available
         if self._vector_memory:
             self._langgraph.attach_vector_memory(self._vector_memory)
         return self
@@ -291,7 +333,6 @@ class ARCAAgent:
         if self._langgraph is None:
             self.enable_langgraph()
 
-        # Build a query record from the current state for semantic RAG search
         ep = state.get("episode_info", {})
         query_record = {
             "total_reward":      ep.get("total_reward", 0.0),
@@ -304,13 +345,11 @@ class ARCAAgent:
             "preset":            self.cfg.env.preset,
         }
 
-        # Inject vector memory directly into langgraph if not attached
         if self._vector_memory and len(self._vector_memory) > 0:
             self._langgraph.attach_vector_memory(self._vector_memory)
 
         result = self._langgraph.reflect(state, query_record=query_record)
 
-        # Write LLM reflection back into last memory record
         buf = getattr(getattr(self, "_trainer", None), "memory_buffer", None)
         if buf and len(buf) > 0 and result.get("reflection"):
             try:
@@ -345,7 +384,6 @@ class ARCAAgent:
                     f"[ARCA VectorMemory] Indexed {added} new episodes "
                     f"({len(self._vector_memory)} total)"
                 )
-        # Attach to langgraph if already initialized
         if self._langgraph:
             self._langgraph.attach_vector_memory(self._vector_memory)
         return self
@@ -358,11 +396,7 @@ class ARCAAgent:
     # ── Offline RL ────────────────────────────────────────────────────────────
 
     def offline_rl_finetune(self) -> dict:
-        """
-        Behavioral-cloning fine-tune on top episodes from the replay buffer.
-        Call after training (or periodically) to enable lifelong improvement.
-        Returns a dict with BC loss stats.
-        """
+        """Behavioral-cloning fine-tune on top episodes from the replay buffer."""
         if not self.cfg.rl.use_gnn or self._model is None:
             print("[ARCA OfflineRL] GNN model not available — skipping BC.")
             return {}
@@ -377,10 +411,10 @@ class ARCAAgent:
             return {}
 
         stats = offline_bc_finetune(
-            trainer   = self._trainer,
-            env       = self.env,
-            cfg       = self.cfg,
-            buf       = buf,
+            trainer = self._trainer,
+            env     = self.env,
+            cfg     = self.cfg,
+            buf     = buf,
         )
         return stats
 

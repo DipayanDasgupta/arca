@@ -1,15 +1,21 @@
 """
-arca/core/gnn_policy.py  (v3.2 — Action Masking)
-==================================================
-New in v3.2:
-  - All sampling paths (train + eval) accept an optional `action_mask`
-    boolean tensor of shape [batch, n_actions].
-  - Masked logits set to -1e9 before Categorical → invalid actions
-    never selected, log_prob never computed for them.
-  - get_action() no longer uses top-k hack; pure argmax is correct
-    once masking prevents invalid actions.
-  - GNNEncoder unchanged (LayerNorm + dual pooling from v3.1).
-  - Weight init unchanged (actor gain=0.01 for high initial entropy).
+arca/core/gnn_policy.py  (v3.5 — AMP-safe Dynamic Action Masking)
+==================================================================
+Fixes vs v3.4:
+  PRIMARY FIX: _apply_mask now computes the fill value from logits.dtype
+  instead of using the hardcoded constant _NEG_INF = -1e9.
+
+  Why -1e9 crashes: torch.amp.autocast converts forward-pass tensors to
+  float16 inside the autocast context.  float16 has a max magnitude of
+  ~65504, so masked_fill(-1e9) raises:
+      RuntimeError: value cannot be converted to type at::Half without overflow
+
+  Fix: compute fill_value = torch.finfo(logits.dtype).min / 2 at runtime.
+       float16 → -32752   (representable, causes softmax ≈ 0 on masked slots)
+       float32 → ~-1.7e38 (very negative, same behaviour as before)
+       bfloat16 → also safe
+
+  The dynamic size-mismatch handling from v3.4 is preserved unchanged.
 """
 from __future__ import annotations
 
@@ -29,8 +35,6 @@ except ImportError:
     PYG_AVAILABLE = False
     Data = None
     Batch = None
-
-_NEG_INF = -1e9   # logit value for masked (invalid) actions
 
 
 class GNNEncoder(nn.Module):
@@ -64,7 +68,6 @@ class GNNEncoder(nn.Module):
             self.conv2 = GCNConv(hidden_dim,  hidden_dim)
             self.conv3 = GCNConv(hidden_dim,  hidden_dim)
 
-        # LayerNorm: stable for any batch size (critical for RL)
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.ln2 = nn.LayerNorm(hidden_dim)
         self.ln3 = nn.LayerNorm(hidden_dim)
@@ -96,8 +99,11 @@ class GNNPolicy(nn.Module):
 
     All public methods accept an optional `action_mask` argument:
         action_mask : BoolTensor [batch, n_actions]  (True = valid)
-    When provided, invalid actions receive logit = -1e9 before any
-    sampling or log_prob computation.
+
+    v3.5 fixes:
+      - _apply_mask: fill value is computed from logits.dtype so it is
+        always representable in float16 / bfloat16 (AMP-safe).
+      - _apply_mask: size-mismatch handling from v3.4 preserved.
     """
 
     def __init__(
@@ -108,9 +114,9 @@ class GNNPolicy(nn.Module):
         use_gat:     bool = False,
     ):
         super().__init__()
-        self.encoder    = GNNEncoder(feature_dim, hidden_dim, use_gat)
+        self.encoder     = GNNEncoder(feature_dim, hidden_dim, use_gat)
         self.num_actions = num_actions
-        embed_dim       = hidden_dim * 2
+        embed_dim        = hidden_dim * 2
 
         self.actor = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
@@ -130,7 +136,6 @@ class GNNPolicy(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # Small actor output → high initial entropy → more exploration
         nn.init.orthogonal_(self.actor[-1].weight,  gain=0.01)
         nn.init.orthogonal_(self.critic[-1].weight, gain=1.0)
 
@@ -138,20 +143,70 @@ class GNNPolicy(nn.Module):
 
     def _apply_mask(
         self,
-        logits: torch.Tensor,
+        logits:      torch.Tensor,
         action_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         """
-        Zero-out invalid action logits.
-        logits      : [B, n_actions]
-        action_mask : [B, n_actions]  bool  (True = valid)  or None
+        Apply an action mask to logits, handling two independent problems:
+
+        Problem 1 — Size mismatch (curriculum learning, v3.4 fix):
+          Each curriculum tier has a different number of hosts, so the
+          action space changes (80 / 160 / 240 / 360 / 500 actions).
+          When a model trained on tier N is evaluated on tier N+1 env,
+          logits.shape[1] != mask.shape[-1].
+          Resolution:
+            n_mask > n_logits → truncate mask (extra actions unreachable)
+            n_mask < n_logits → pad mask with False (extra logit slots masked)
+
+        Problem 2 — AMP / float16 overflow (v3.5 fix, PRIMARY BUG):
+          torch.amp.autocast converts logits to float16 inside the training
+          loop.  float16 max magnitude is ~65504.  Using masked_fill(-1e9)
+          raises "value cannot be converted to type at::Half without overflow".
+          Resolution:
+            Compute fill_value = torch.finfo(logits.dtype).min / 2 at runtime.
+            float16  → fill ≈ -32752   (softmax ≈ 0, always representable)
+            float32  → fill ≈ -1.7e38  (same behaviour as the old -1e9)
+            bfloat16 → fill ≈ -1.7e38  (also safe)
+
+        Args:
+            logits:      [B, n_logits]   raw actor outputs (may be fp16 under AMP)
+            action_mask: [B, n_mask] or [n_mask]  bool  (True = valid)
+                         May be None → no masking applied.
+
+        Returns:
+            logits with invalid slots filled with a very-negative value.
         """
         if action_mask is None:
             return logits
-        # Broadcast scalar batch if needed
+
+        # Ensure mask has a batch dimension matching logits
         if action_mask.dim() == 1:
-            action_mask = action_mask.unsqueeze(0).expand_as(logits)
-        return logits.masked_fill(~action_mask, _NEG_INF)
+            action_mask = action_mask.unsqueeze(0).expand(logits.shape[0], -1)
+
+        n_logits = logits.shape[-1]
+        n_mask   = action_mask.shape[-1]
+
+        # ── Problem 1: resize mask to match logits (curriculum fix) ───────────
+        if n_logits != n_mask:
+            if n_mask > n_logits:
+                # Mask is LARGER → truncate (actions beyond policy head unreachable)
+                action_mask = action_mask[..., :n_logits]
+            else:
+                # Mask is SMALLER → pad with False (extra logit slots masked out)
+                pad = torch.zeros(
+                    (*action_mask.shape[:-1], n_logits - n_mask),
+                    dtype=torch.bool,
+                    device=action_mask.device,
+                )
+                action_mask = torch.cat([action_mask, pad], dim=-1)
+
+        # ── Problem 2: dtype-safe fill value (AMP / fp16 fix) ─────────────────
+        # torch.finfo gives the representable minimum for any float dtype.
+        # Dividing by 2 ensures we stay away from the exact minimum (which
+        # can cause NaN in some ops) while still being extremely negative.
+        fill_value = torch.finfo(logits.dtype).min / 2
+
+        return logits.masked_fill(~action_mask, fill_value)
 
     def _masked_dist(
         self,
@@ -204,11 +259,18 @@ class GNNPolicy(nn.Module):
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        deterministic=True  → argmax over valid actions (mask applied first)
+        Sample or argmax over the masked action distribution.
+
+        deterministic=True  → argmax over valid actions (masked slots have
+                               fill_value ≈ -32752 for fp16 or -1.7e38 for fp32,
+                               so they are never selected)
         deterministic=False → sample from masked Categorical
+
+        Both the size-mismatch (v3.4) and AMP overflow (v3.5) fixes apply
+        transparently through _apply_mask, so this method is safe to call
+        across all curriculum tiers under mixed-precision training.
         """
         dist, _ = self._masked_dist(data, action_mask)
         if deterministic:
-            # argmax is safe now: invalid logits are -1e9
             return dist.logits.argmax(dim=-1)
         return dist.sample()

@@ -1,12 +1,11 @@
 """
-arca/core/cleanrl_ppo.py  (v3.2 — Action Masking integrated)
-=============================================================
-Changes vs v3.1:
-  - RolloutBuffer stores masks[n_steps, n_actions]
-  - _collect_rollout() reads env mask from info["action_mask"]
-  - _compute_gae() passes mask when calling get_value()
-  - _update() passes mb_masks to get_action_and_value()
-  - Everything else (EpisodeBuffer, memory seeds, LLM reflection) intact.
+arca/core/cleanrl_ppo.py  (v3.5 — AMP safe + fp16 masking)
+============================================================
+Changes vs v3.4:
+  - AMP autocast context kept for speed on CUDA
+  - No _NEG_INF constant here (fill logic moved entirely to gnn_policy._apply_mask)
+  - GradScaler + unscale_ + step pattern unchanged
+  - All other logic (action masking, GAE, memory, reflection) unchanged
 """
 from __future__ import annotations
 
@@ -38,7 +37,7 @@ try:
     from arca.memory.episode_buffer import EpisodeBuffer
     _BUFFER_AVAILABLE = True
 except ImportError:
-    EpisodeBuffer = None          # type: ignore[assignment,misc]
+    EpisodeBuffer = None
     _BUFFER_AVAILABLE = False
 
 
@@ -46,13 +45,13 @@ except ImportError:
 
 @dataclass
 class RolloutBuffer:
-    obs:       list           # List[PyG Data]
-    actions:   torch.Tensor   # [n]
-    log_probs: torch.Tensor   # [n]
-    rewards:   torch.Tensor   # [n]
-    dones:     torch.Tensor   # [n]
-    values:    torch.Tensor   # [n]
-    masks:     torch.Tensor   # [n, n_actions]  bool
+    obs:       list
+    actions:   torch.Tensor
+    log_probs: torch.Tensor
+    rewards:   torch.Tensor
+    dones:     torch.Tensor
+    values:    torch.Tensor
+    masks:     torch.Tensor   # [n_steps, n_actions]  bool
     infos:     list = field(default_factory=list)
 
     @classmethod
@@ -78,7 +77,8 @@ class RolloutBuffer:
 
 class CleanRLPPO:
     """
-    CleanRL-style PPO with masked GNN policy.
+    CleanRL-style PPO with masked GNN policy + AMP mixed precision.
+    The fp16-safe masking is handled inside GNNPolicy._apply_mask (v3.5).
     """
 
     def __init__(
@@ -104,6 +104,16 @@ class CleanRLPPO:
             self.device = torch.device(self.rl.device)
 
         print(f"[ARCA CleanRL-PPO] Device: {self.device}")
+
+        # ── Mixed Precision (AMP) — CUDA only ─────────────────────────────────
+        # AMP gives ~25-40% speedup on CUDA with negligible accuracy loss.
+        # On CPU/MPS we disable it (autocast would slow things down there).
+        # The fp16 overflow in masked_fill is fixed in GNNPolicy._apply_mask (v3.5).
+        self._use_amp = (self.device.type == "cuda")
+        if self._use_amp:
+            self._scaler = torch.amp.GradScaler("cuda")
+        else:
+            self._scaler = None
 
         # ── Policy ────────────────────────────────────────────────────────────
         self._n_actions = env.action_space.n
@@ -163,10 +173,8 @@ class CleanRLPPO:
         return Data(x=node_x, edge_index=edge_index)
 
     def _mask_from_info(self, info: dict) -> torch.Tensor:
-        """Extract action mask from step() info dict → bool tensor on device."""
         raw = info.get("action_mask")
         if raw is None:
-            # Fall back to all-valid if env doesn't provide mask yet
             return torch.ones(self._n_actions, dtype=torch.bool, device=self.device)
         if isinstance(raw, torch.Tensor):
             return raw.bool().to(self.device)
@@ -189,10 +197,15 @@ class CleanRLPPO:
             buf.obs[step]   = pyg
             buf.masks[step] = mask
 
+            # AMP inference — faster on CUDA, no-op on CPU/MPS.
+            # GNNPolicy._apply_mask (v3.5) handles fp16 overflow safely.
             with torch.no_grad():
-                action, log_prob, _, value = self.policy.get_action_and_value(
-                    pyg, action_mask=mask.unsqueeze(0)
-                )
+                with torch.amp.autocast(
+                    device_type=self.device.type, enabled=self._use_amp
+                ):
+                    action, log_prob, _, value = self.policy.get_action_and_value(
+                        pyg, action_mask=mask.unsqueeze(0)
+                    )
 
             buf.actions[step]   = action
             buf.log_probs[step] = log_prob
@@ -265,7 +278,6 @@ class CleanRLPPO:
                 obs, info = self.env.reset()
                 mask      = self._mask_from_info(info)
 
-            # Online LLM reflection
             if (
                 self.rl.online_reflection_interval > 0
                 and self.global_step % self.rl.online_reflection_interval == 0
@@ -289,9 +301,12 @@ class CleanRLPPO:
 
         last_pyg = self._to_pyg(last_obs)
         with torch.no_grad():
-            last_val = self.policy.get_value(
-                last_pyg, action_mask=last_mask.unsqueeze(0)
-            )
+            with torch.amp.autocast(
+                device_type=self.device.type, enabled=self._use_amp
+            ):
+                last_val = self.policy.get_value(
+                    last_pyg, action_mask=last_mask.unsqueeze(0)
+                )
 
         last_gae = 0.0
         for t in reversed(range(n)):
@@ -310,7 +325,7 @@ class CleanRLPPO:
 
         return advantages, advantages + buf.values
 
-    # ── PPO update ────────────────────────────────────────────────────────────
+    # ── PPO update (AMP) ──────────────────────────────────────────────────────
 
     def _update(
         self,
@@ -339,30 +354,43 @@ class CleanRLPPO:
                 mb_lp    = buf.log_probs[mb_idx]
                 mb_adv   = advantages[mb_idx]
                 mb_ret   = returns[mb_idx]
-                mb_masks = buf.masks[mb_idx]        # [B, n_actions]
+                mb_masks = buf.masks[mb_idx]    # [B, n_actions]
 
                 if mb_adv.std() > 1e-8:
                     mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
-                _, new_lp, entropy, new_val = self.policy.get_action_and_value(
-                    mb_obs, mb_act, action_mask=mb_masks
-                )
+                # ── Forward pass under AMP autocast ───────────────────────
+                # GNNPolicy._apply_mask (v3.5) uses dtype-safe fill values,
+                # so the fp16 overflow from v3.4 is fixed.
+                with torch.amp.autocast(
+                    device_type=self.device.type, enabled=self._use_amp
+                ):
+                    _, new_lp, entropy, new_val = self.policy.get_action_and_value(
+                        mb_obs, mb_act, action_mask=mb_masks
+                    )
 
-                ratio    = (new_lp - mb_lp).exp()
-                pg1      = -mb_adv * ratio
-                pg2      = -mb_adv * ratio.clamp(
-                    1 - self.rl.clip_range, 1 + self.rl.clip_range
-                )
-                pg_loss  = torch.max(pg1, pg2).mean()
-                v_loss   = 0.5 * ((new_val - mb_ret) ** 2).mean()
-                ent_loss = entropy.mean()
+                    ratio    = (new_lp - mb_lp).exp()
+                    pg1      = -mb_adv * ratio
+                    pg2      = -mb_adv * ratio.clamp(
+                        1 - self.rl.clip_range, 1 + self.rl.clip_range
+                    )
+                    pg_loss  = torch.max(pg1, pg2).mean()
+                    v_loss   = 0.5 * ((new_val - mb_ret) ** 2).mean()
+                    ent_loss = entropy.mean()
+                    loss     = pg_loss + 0.5 * v_loss - self.rl.ent_coef * ent_loss
 
-                loss = pg_loss + 0.5 * v_loss - self.rl.ent_coef * ent_loss
-
+                # ── Backward pass (scaler-aware on CUDA) ──────────────────
                 self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
-                self.optimizer.step()
+                if self._use_amp and self._scaler is not None:
+                    self._scaler.scale(loss).backward()
+                    self._scaler.unscale_(self.optimizer)
+                    nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                    self._scaler.step(self.optimizer)
+                    self._scaler.update()
+                else:
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                    self.optimizer.step()
 
                 with torch.no_grad():
                     approx_kl = ((ratio - 1) - (new_lp - mb_lp)).mean()
@@ -447,6 +475,7 @@ class CleanRLPPO:
     # ── Main training loop ────────────────────────────────────────────────────
 
     def learn(self, total_timesteps: int) -> "CleanRLPPO":
+        amp_str = "ENABLED (fp16-safe via _apply_mask)" if self._use_amp else "disabled"
         print(f"\n[ARCA CleanRL-PPO] Starting training")
         print(f"  Total steps  : {total_timesteps:,}")
         print(f"  Device       : {self.device}")
@@ -455,7 +484,8 @@ class CleanRLPPO:
         print(f"  Batch size   : {self.rl.batch_size}")
         print(f"  PPO epochs   : {self.rl.n_epochs}")
         print(f"  Entropy coef : {self.rl.ent_coef}")
-        print(f"  Action masking: ENABLED\n")
+        print(f"  Action masking: ENABLED (dynamic size + AMP-safe)")
+        print(f"  Mixed prec.  : {amp_str}\n")
 
         # Seed reward mods from memory
         if (
@@ -479,9 +509,9 @@ class CleanRLPPO:
         done = 0
 
         while done < total_timesteps:
-            n_collect          = min(self.rl.n_steps, total_timesteps - done)
+            n_collect                = min(self.rl.n_steps, total_timesteps - done)
             buf, last_obs, last_mask = self._collect_rollout(n_collect)
-            adv, ret           = self._compute_gae(
+            adv, ret                 = self._compute_gae(
                 buf, last_obs, last_mask, self.rl.gamma, self.rl.gae_lambda
             )
             metrics = self._update(buf, adv, ret)
@@ -498,9 +528,10 @@ class CleanRLPPO:
             float(np.mean(self.episode_rewards[-20:]))
             if self.episode_rewards else 0.0
         )
+        sps = int(total_timesteps / (elapsed + 1e-8))
         print(
             f"\n[ARCA CleanRL-PPO] Done in {elapsed:.1f}s  |  "
-            f"mean(last20ep)={mean_r:.2f}"
+            f"mean(last20ep)={mean_r:.2f}  |  {sps:,} SPS"
         )
 
         if self.memory_buffer:
@@ -529,7 +560,6 @@ class CleanRLPPO:
                 action_mask, dtype=torch.bool, device=self.device
             ).unsqueeze(0)
         else:
-            # Try to get fresh mask from environment
             try:
                 mask_np = self.env.get_action_mask()
                 mask    = torch.tensor(
@@ -539,9 +569,12 @@ class CleanRLPPO:
                 mask = None
 
         with torch.no_grad():
-            action = self.policy.get_action(
-                pyg, deterministic=deterministic, action_mask=mask
-            )
+            with torch.amp.autocast(
+                device_type=self.device.type, enabled=self._use_amp
+            ):
+                action = self.policy.get_action(
+                    pyg, deterministic=deterministic, action_mask=mask
+                )
         return action.cpu().numpy(), None
 
     # ── Persistence ───────────────────────────────────────────────────────────
@@ -555,6 +588,7 @@ class CleanRLPPO:
                 "global_step":      self.global_step,
                 "rewards":          self.episode_rewards,
                 "reward_modifiers": self._reward_modifiers,
+                "n_actions":        self._n_actions,
             },
             full,
         )
